@@ -13,6 +13,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch._dynamo
 from torch.utils.data import DataLoader, IterableDataset
 from accelerate import Accelerator
 
@@ -651,7 +652,6 @@ def train():
     # are compiled correctly.
     if args.compile and device.type == "cuda":
         print("[Rhapsody] Compiling model with torch.compile...")
-        import torch._dynamo
         os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(output_dir / ".inductor_cache"))
         torch._dynamo.config.cache_size_limit = 64
         model = torch.compile(model)
