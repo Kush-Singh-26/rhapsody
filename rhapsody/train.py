@@ -440,13 +440,12 @@ def train():
     tokenizer = get_tokenizer(symbolic=is_symbolic)
     vocab_size = len(tokenizer)
 
-    # ── Model + Dataset per stage ────────────────────────────────────────────
+    # ── Model per stage ──────────────────────────────────────────────────────
     if args.stage == "pretrain":
         print("[Rhapsody] Stage 1: Text Pretraining")
         model = create_text_only_65m(vocab_size=vocab_size)
         model.config.gradient_checkpointing = args.grad_checkpoint
         model = model.to(device)
-        dataset = TextPretrainDataset(tokenizer, seq_len=args.seq_len)
 
     elif args.stage == "align":
         print("[Rhapsody] Stage 2: Audio-Text Alignment (projector only)")
@@ -465,34 +464,12 @@ def train():
 
         model = model.to(device)
 
-        if is_symbolic:
-            dataset = SymbolicMusicDataset(
-                tokenizer,
-                seq_len=args.seq_len,
-                dataset_path=args.symbolic_dataset,
-                hf_dataset=args.symbolic_hf,
-                max_examples=args.symbolic_max_examples,
-            )
-        else:
-            dataset = AudioTextDataset(tokenizer, seq_len=args.seq_len)
-
     else:  # finetune
         print("[Rhapsody] Stage 3: Instruction Fine-tuning (full model, encoder stays frozen)")
         model = create_rhapsody_65m(vocab_size=vocab_size)
         model.config.gradient_checkpointing = args.grad_checkpoint
         model.text_lm.config.gradient_checkpointing = args.grad_checkpoint
         model = model.to(device)
-
-        if is_symbolic:
-            dataset = SymbolicMusicDataset(
-                tokenizer,
-                seq_len=args.seq_len,
-                dataset_path=args.symbolic_dataset,
-                hf_dataset=args.symbolic_hf,
-                max_examples=args.symbolic_max_examples,
-            )
-        else:
-            dataset = AudioTextDataset(tokenizer, seq_len=args.seq_len)
 
     # ── Optimizer ────────────────────────────────────────────────────────────
     # 1. Muon parameters: 2D+ weight matrices for Attention/FFN projections inside text LM.
@@ -633,6 +610,26 @@ def train():
             # Fallback if scheduler state is missing: set last_epoch manually
             scheduler.last_epoch = start_step
 
+    # ── Dataset per stage ────────────────────────────────────────────────────
+    global_batch_size = args.batch_size * args.grad_accum * accelerator.num_processes
+    if args.stage == "pretrain":
+        dataset = TextPretrainDataset(
+            tokenizer,
+            seq_len=args.seq_len,
+            resume_step=start_step,
+            global_batch_size=global_batch_size
+        )
+    elif is_symbolic:
+        dataset = SymbolicMusicDataset(
+            tokenizer,
+            seq_len=args.seq_len,
+            dataset_path=args.symbolic_dataset,
+            hf_dataset=args.symbolic_hf,
+            max_examples=args.symbolic_max_examples,
+        )
+    else:
+        dataset = AudioTextDataset(tokenizer, seq_len=args.seq_len)
+
     # ── DataLoader ────────────────────────────────────────────────────────────
     # IterableDatasets are not safe to shard across workers without a worker_init_fn.
     # Use num_workers=0 for streaming/iterable datasets to avoid duplicate samples.
@@ -654,6 +651,9 @@ def train():
         else:
             dataset = torch.utils.data.Subset(dataset, [])
         batches_to_skip = 0  # Handled via Subset
+    elif is_iterable:
+        # Iterable datasets are now fast-forwarded O(1) inside TextPretrainDataset initialization
+        batches_to_skip = 0
 
     dataloader = DataLoader(
         dataset,
@@ -692,16 +692,8 @@ def train():
     micro_steps_in_window = 0
     window_start = time.time()
 
-    # Track how many batches to skip to resume the dataset position properly (for iterable datasets only now)
-    if batches_to_skip > 0:
-        print(f"[Rhapsody] Fast-forwarding iterable dataloader by {batches_to_skip} batches...")
-
     while step < total_steps:
         for batch in dataloader:
-            if batches_to_skip > 0:
-                batches_to_skip -= 1
-                continue
-
             if step >= total_steps:
                 break
 

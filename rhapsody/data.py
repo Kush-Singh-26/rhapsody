@@ -73,27 +73,33 @@ class TextPretrainDataset(IterableDataset):
         fineweb_ratio: float = 0.70,
         dclm_ratio: float = 0.25,
         cosmopedia_ratio: float = 0.05,
+        resume_step: int = 0,
+        global_batch_size: int = 64,
     ):
         self.tokenizer = tokenizer
         self.seq_len = seq_len
 
+        # Calculate approximate documents to skip (assuming ~1000 tokens per document)
+        total_tokens_to_skip = resume_step * global_batch_size * seq_len
+        docs_to_skip = total_tokens_to_skip // 1000
+
         datasets_list = []
         weights = []
 
-        print("[Rhapsody] Loading FineWeb-Edu...")
-        fw = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT",
-                          split="train", streaming=True)
+        print(f"[Rhapsody] Fast-forwarding streaming datasets by ~{docs_to_skip} documents...")
+
+        fw = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
+        if docs_to_skip > 0: fw = fw.skip(int(docs_to_skip * fineweb_ratio))
         datasets_list.append(fw)
         weights.append(fineweb_ratio)
 
-        print("[Rhapsody] Loading DCLM-Baseline...")
-        dclm = load_dataset("mlfoundations/dclm-baseline-1.0",
-                            split="train", streaming=True)
+        dclm = load_dataset("mlfoundations/dclm-baseline-1.0", split="train", streaming=True)
+        if docs_to_skip > 0: dclm = dclm.skip(int(docs_to_skip * dclm_ratio))
         datasets_list.append(dclm)
         weights.append(dclm_ratio)
 
-        print("[Rhapsody] Loading Cosmopedia v2...")
         cosmo = load_dataset("HuggingFaceTB/cosmopedia-v2", name="cosmopedia-v2", split="train", streaming=True)
+        if docs_to_skip > 0: cosmo = cosmo.skip(int(docs_to_skip * cosmopedia_ratio))
         datasets_list.append(cosmo)
         weights.append(cosmopedia_ratio)
 
