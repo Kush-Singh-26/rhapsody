@@ -25,7 +25,7 @@ def load_audio(path: str, target_sr: int = 48000) -> torch.Tensor:
 
 
 def load_model(checkpoint_path: str, device: str = "cpu") -> torch.nn.Module:
-    """Load model from a checkpoint, auto-detecting TextLM vs AudioForgeModel."""
+    """Load model from a checkpoint, auto-detecting TextLM vs RhapsodyModel."""
     # Use weights_only=False to ensure compatibility with custom checkpoint metadata (like python_random_state)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
@@ -55,7 +55,7 @@ def load_model(checkpoint_path: str, device: str = "cpu") -> torch.nn.Module:
     model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
-    print(f"[AudioForge] Loaded {'Multimodal' if is_multimodal else 'Text-only'} model on {device}.")
+    print(f"[Rhapsody] Loaded {'Multimodal' if is_multimodal else 'Text-only'} model on {device}.")
     return model
 
 
@@ -73,12 +73,12 @@ def generate(
 ):
     """
     Perform autoregressive text generation using KV cache.
-    Supports both AudioForgeModel (with audio prefix) and TextLM (text-only).
+    Supports both RhapsodyModel (with audio prefix) and TextLM (text-only).
 
     WARNING: The multimodal KV-cache decoding path is experimental and has not
     been fully validated under heavy workloads or complex batching profiles.
     """
-    is_multimodal = isinstance(model, AudioForgeModel)
+    is_multimodal = isinstance(model, RhapsodyModel)
     is_symbolic = task == "symbolic-music"
     
     # ── 1. Process Audio Prefix ──────────────────────────────────────────────
@@ -87,13 +87,13 @@ def generate(
         if not is_multimodal:
             print("[Warning] Audio path provided, but the model is text-only. Ignoring audio.")
         else:
-            print(f"[AudioForge] Loading audio: {audio_path} ...")
+            print(f"[Rhapsody] Loading audio: {audio_path} ...")
             waveform = load_audio(audio_path, target_sr=48000)
             
             from transformers import ClapProcessor
             processor = ClapProcessor.from_pretrained(model.config.audio_encoder_type)
             
-            print("[AudioForge] Running CLAP encoder...")
+            print("[Rhapsody] Running CLAP encoder...")
             feats = processor(
                 audios=waveform.numpy(),
                 sampling_rate=48000,
@@ -114,8 +114,8 @@ def generate(
     
     input_ids = tokenizer(input_text, return_tensors="pt")["input_ids"].to(device)
     
-    print(f"[AudioForge] Prompt: {repr(input_text)}")
-    print("[AudioForge] Starting autoregressive generation with KV Cache...")
+    print(f"[Rhapsody] Prompt: {repr(input_text)}")
+    print("[Rhapsody] Starting autoregressive generation with KV Cache...")
     
     # ── 3. Generation Loop ───────────────────────────────────────────────────
     generated_tokens = []
@@ -221,7 +221,7 @@ def sample_next_token(logits: torch.Tensor, temperature: float, top_p: float) ->
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Autoregressive generation with KV Cache for AudioForge.")
+    parser = argparse.ArgumentParser(description="Autoregressive generation with KV Cache for Rhapsody.")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to model checkpoint. If not provided, initialize a random model.")
     parser.add_argument("--text-only", action="store_true",

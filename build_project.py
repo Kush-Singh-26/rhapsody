@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Build script for AudioForge project.
+Build script for Rhapsody project.
 
 WARNING: Running this script will OVERWRITE existing source files.
 It is intended only for initial project scaffolding.
@@ -11,11 +11,11 @@ import argparse
 import os
 import sys
 
-AUDIOFORGE_DIR = os.path.dirname(os.path.abspath(__file__))
+RHAPSODY_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def write_file(rel_path: str, content: str, force: bool = False) -> None:
-    path = os.path.join(AUDIOFORGE_DIR, rel_path)
+    path = os.path.join(RHAPSODY_DIR, rel_path)
     os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
     if os.path.exists(path) and not force:
         print(f"  Skipped (already exists): {rel_path}  — use --force to overwrite")
@@ -34,14 +34,14 @@ def main():
     args = parser.parse_args()
 
     if not args.force:
-        print("AudioForge build script — dry run (no files will be overwritten).")
+        print("Rhapsody build script — dry run (no files will be overwritten).")
         print("Pass --force to actually write files.")
         print()
 
-    print("Building AudioForge project...")
+    print("Building Rhapsody project...")
     _write_all(force=args.force)
     print("\nDone!")
-    print(f"Files {'written' if args.force else 'checked'} in: {AUDIOFORGE_DIR}")
+    print(f"Files {'written' if args.force else 'checked'} in: {RHAPSODY_DIR}")
 
 
 def _write_all(force: bool = False) -> None:

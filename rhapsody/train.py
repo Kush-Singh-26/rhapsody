@@ -1,4 +1,4 @@
-"""AudioForge Training Script — Muon + AdamW, WSD schedule, 3-stage pipeline."""
+"""Rhapsody Training Script — Muon + AdamW, WSD schedule, 3-stage pipeline."""
 
 from __future__ import annotations
 
@@ -217,10 +217,10 @@ def compute_loss(model: nn.Module, batch: dict, device: torch.device) -> torch.T
     audio_features = batch.get("audio_features")
 
     if audio_features is not None:
-        # Stage 2 / 3: multimodal batch — model is AudioForgeModel
+        # Stage 2 / 3: multimodal batch — model is RhapsodyModel
         output = model(input_ids, audio_features=audio_features.to(device), labels=labels)
     else:
-        # Stage 1: text-only batch — model may be TextLM or AudioForgeModel
+        # Stage 1: text-only batch — model may be TextLM or RhapsodyModel
         # TextLM.forward() has no audio_features param, so call without it
         output = model(input_ids, labels=labels)
 
@@ -265,7 +265,7 @@ def find_latest_checkpoint(output_dir: Path) -> Optional[Path]:
 
 
 def extract_text_lm_state(state_dict: dict) -> dict:
-    """Accept either a TextLM checkpoint or an AudioForgeModel checkpoint."""
+    """Accept either a TextLM checkpoint or a RhapsodyModel checkpoint."""
     if any(k.startswith("text_lm.") for k in state_dict):
         return {
             k.removeprefix("text_lm."): v
@@ -342,7 +342,7 @@ def save_checkpoint(
 
 def train():
     import argparse
-    parser = argparse.ArgumentParser(description="AudioForge Training")
+    parser = argparse.ArgumentParser(description="Rhapsody Training")
     parser.add_argument("--task", type=str, default="audio-captioning",
                         choices=["audio-captioning", "symbolic-music"],
                         help="Task type: audio-captioning (default) | symbolic-music")
@@ -413,16 +413,16 @@ def train():
         torch.cuda.manual_seed_all(args.seed)
 
     # ── Device / dtype ──────────────────────────────────────────────────────
-    print(f"[AudioForge] Device: {device}")
+    print(f"[Rhapsody] Device: {device}")
 
     if device.type == "cuda":
         major, _ = torch.cuda.get_device_capability()
         dtype = torch.bfloat16 if major >= 8 else torch.float16
-        print(f"[AudioForge] GPU: {torch.cuda.get_device_name()}")
-        print(f"[AudioForge] dtype: {dtype}, managed by Accelerator")
+        print(f"[Rhapsody] GPU: {torch.cuda.get_device_name()}")
+        print(f"[Rhapsody] dtype: {dtype}, managed by Accelerator")
         if major >= 8:
             torch.set_float32_matmul_precision('high')
-            print("[AudioForge] Set float32 matmul precision to 'high' (enables TF32)")
+            print("[Rhapsody] Set float32 matmul precision to 'high' (enables TF32)")
     else:
         dtype = torch.float32
 
@@ -545,10 +545,10 @@ def train():
     # Use WSD for Stage 1 pretraining; Cosine Decay with Warmup for Stage 2 & 3
     total_opt_steps = args.max_steps
     if args.stage == "pretrain":
-        print("[AudioForge] Scheduler: Warmup-Stable-Decay (WSD)")
+        print("[Rhapsody] Scheduler: Warmup-Stable-Decay (WSD)")
         lr_fn = lambda step, n=total_opt_steps: get_wsd_lr(step, n)
     else:
-        print("[AudioForge] Scheduler: Cosine Decay with Warmup")
+        print("[Rhapsody] Scheduler: Cosine Decay with Warmup")
         lr_fn = lambda step, n=total_opt_steps: get_cosine_lr(step, n, warmup_frac=0.03)
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -584,7 +584,7 @@ def train():
         opt_pt = ckpt_path / "optimizer.pt"
         sched_pt = ckpt_path / "scheduler.pt"
         if model_pt.exists():
-            print(f"[AudioForge] Resuming from {ckpt_path}")
+            print(f"[Rhapsody] Resuming from {ckpt_path}")
             ckpt = torch.load(model_pt, map_location=device, weights_only=True)
             # Support both wrapped and unwrapped checkpoints
             state_dict = ckpt["model"]
@@ -598,12 +598,12 @@ def train():
                 random.setstate(ckpt["python_random_state"])
             if torch.cuda.is_available() and "cuda_rng_state_all" in ckpt:
                 torch.cuda.set_rng_state_all(ckpt["cuda_rng_state_all"])
-            print(f"[AudioForge] Resumed at step {start_step}")
+            print(f"[Rhapsody] Resumed at step {start_step}")
         if opt_pt.exists():
             opt_ckpt = torch.load(opt_pt, map_location=device, weights_only=True)
             optimizer.load_state_dict(opt_ckpt["optimizer"])
         if sched_pt.exists():
-            print(f"[AudioForge] Loading scheduler state from {sched_pt}")
+            print(f"[Rhapsody] Loading scheduler state from {sched_pt}")
             sched_ckpt = torch.load(sched_pt, map_location=device, weights_only=True)
             scheduler.load_state_dict(sched_ckpt["scheduler"])
         else:
@@ -625,7 +625,7 @@ def train():
     batches_to_skip = start_step * args.grad_accum
     if not is_iterable and batches_to_skip > 0:
         examples_to_skip = batches_to_skip * args.batch_size * accelerator.num_processes
-        print(f"[AudioForge] Fast-forwarding map-style dataset by {examples_to_skip} examples...")
+        print(f"[Rhapsody] Fast-forwarding map-style dataset by {examples_to_skip} examples...")
         if examples_to_skip < len(dataset):
             dataset = torch.utils.data.Subset(dataset, range(examples_to_skip, len(dataset)))
         else:
@@ -650,7 +650,7 @@ def train():
     # The optimizer holds references to the original model parameters, and DDP wrappers
     # are compiled correctly.
     if args.compile and device.type == "cuda":
-        print("[AudioForge] Compiling model with torch.compile...")
+        print("[Rhapsody] Compiling model with torch.compile...")
         import torch._dynamo
         os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(output_dir / ".inductor_cache"))
         torch._dynamo.config.cache_size_limit = 64
@@ -659,7 +659,7 @@ def train():
     # ── Training ─────────────────────────────────────────────────────────────
     total_steps = args.max_steps
     eff_batch = args.batch_size * args.grad_accum * accelerator.num_processes
-    print(f"[AudioForge] Training: {total_steps} optimizer steps, "
+    print(f"[Rhapsody] Training: {total_steps} optimizer steps, "
           f"batch={args.batch_size}, accum={args.grad_accum}, eff_batch={eff_batch}")
 
     model.train()
@@ -672,7 +672,7 @@ def train():
 
     # Track how many batches to skip to resume the dataset position properly (for iterable datasets only now)
     if batches_to_skip > 0:
-        print(f"[AudioForge] Fast-forwarding iterable dataloader by {batches_to_skip} batches...")
+        print(f"[Rhapsody] Fast-forwarding iterable dataloader by {batches_to_skip} batches...")
 
     while step < total_steps:
         for batch in dataloader:
@@ -711,7 +711,7 @@ def train():
                         step += 1
                         running_grad_norm += grad_norm_val
                     else:
-                        print("  [AudioForge] Warning: Gradient overflow detected, skipping optimizer step.")
+                        print("  [Rhapsody] Warning: Gradient overflow detected, skipping optimizer step.")
 
                 optimizer.zero_grad(set_to_none=True)
 
@@ -765,11 +765,11 @@ def train():
                                         local_ckpts.append((int(suffix), item))
                             local_ckpts.sort()
                             for _, old_ckpt in local_ckpts[:-3]:
-                                print(f"  [AudioForge] Pruning old local checkpoint: {old_ckpt.name}")
+                                print(f"  [Rhapsody] Pruning old local checkpoint: {old_ckpt.name}")
                                 import shutil
                                 shutil.rmtree(old_ckpt)
                         except Exception as e:
-                            print(f"  [AudioForge] WARNING: local checkpoint pruning failed: {e}")
+                            print(f"  [Rhapsody] WARNING: local checkpoint pruning failed: {e}")
 
                         if hub_manager is not None:
                             # Prune after uploading to avoid race condition where we delete what we upload
@@ -778,7 +778,7 @@ def train():
                                     hub_manager.upload_checkpoint(ckpt_dir, step)
                                     hub_manager.prune_checkpoints()
                                 except Exception as e:
-                                    print(f"  [AudioForge] Hub sync error at step {step}: {e}")
+                                    print(f"  [Rhapsody] Hub sync error at step {step}: {e}")
 
                             import threading
                             threading.Thread(
@@ -792,7 +792,7 @@ def train():
 
     # ── Final save ─────────────────────────────────────────────────────────
     accelerator.wait_for_everyone()
-    print("[AudioForge] Training complete!")
+    print("[Rhapsody] Training complete!")
     final_dir = output_dir / "final"
     if accelerator.is_main_process:
         final_dir.mkdir(parents=True, exist_ok=True)
@@ -804,7 +804,7 @@ def train():
              if hasattr(raw_model, "config") else {}},
             final_dir / "model.pt",
         )
-        print(f"[AudioForge] Final model saved to {final_dir}")
+        print(f"[Rhapsody] Final model saved to {final_dir}")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""AudioForge Data Pipeline."""
+"""Rhapsody Data Pipeline."""
 
 from __future__ import annotations
 
@@ -16,13 +16,13 @@ import torchaudio
 def get_tokenizer(symbolic: bool = False) -> AutoTokenizer:
     """
     Load the cosmo2-tokenizer (falls back to gpt2 if unavailable).
-    Adds AudioForge special tokens: <|pad|>, <|audio|>, <|text|>.
+    Adds Rhapsody special tokens: <|pad|>, <|audio|>, <|text|>.
     """
     try:
         tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/cosmo2-tokenizer")
-        print(f"[AudioForge] Loaded cosmo2-tokenizer (vocab={tokenizer.vocab_size})")
+        print(f"[Rhapsody] Loaded cosmo2-tokenizer (vocab={tokenizer.vocab_size})")
     except Exception:
-        print("[AudioForge] cosmo2-tokenizer not found, falling back to gpt2 tokenizer")
+        print("[Rhapsody] cosmo2-tokenizer not found, falling back to gpt2 tokenizer")
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
 
     special = ["<|pad|>", "<|audio|>", "<|text|>"]
@@ -42,7 +42,7 @@ def get_tokenizer(symbolic: bool = False) -> AutoTokenizer:
         )
     num_added = tokenizer.add_special_tokens({"additional_special_tokens": special})
     if num_added > 0:
-        print(f"[AudioForge] Added {num_added} special tokens")
+        print(f"[Rhapsody] Added {num_added} special tokens")
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -81,24 +81,24 @@ class TextPretrainDataset(IterableDataset):
         datasets_list = []
         weights = []
 
-        print("[AudioForge] Loading FineWeb-Edu...")
+        print("[Rhapsody] Loading FineWeb-Edu...")
         fw = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT",
                           split="train", streaming=True)
         datasets_list.append(fw)
         weights.append(fineweb_ratio)
 
-        print("[AudioForge] Loading DCLM-Baseline...")
+        print("[Rhapsody] Loading DCLM-Baseline...")
         dclm = load_dataset("mlfoundations/dclm-baseline-1.0",
                             split="train", streaming=True)
         datasets_list.append(dclm)
         weights.append(dclm_ratio)
 
-        print("[AudioForge] Loading Stack-Edu...")
+        print("[Rhapsody] Loading Stack-Edu...")
         stack = load_dataset("HuggingFaceTB/stack-edu", split="train", streaming=True)
         datasets_list.append(stack)
         weights.append(stack_edu_ratio)
 
-        print("[AudioForge] Loading Cosmopedia v2...")
+        print("[Rhapsody] Loading Cosmopedia v2...")
         cosmo = load_dataset("HuggingFaceTB/cosmopedia-v2", split="train", streaming=True)
         datasets_list.append(cosmo)
         weights.append(cosmopedia_ratio)
@@ -179,7 +179,7 @@ class AudioTextDataset(Dataset):
         self.examples: list[dict] = []
         self._datasets: dict[str, object] = {}   # keyed by source name, holds HF dataset
 
-        print(f"[AudioForge] Loading Clotho ({clotho_split} split)...")
+        print(f"[Rhapsody] Loading Clotho ({clotho_split} split)...")
         try:
             # Clotho is open access and houses audio bytes natively in HF dataset cache
             clotho = load_dataset("soundata/clotho", split=clotho_split)
@@ -194,12 +194,12 @@ class AudioTextDataset(Dataset):
                             "source": "clotho",
                             "index": i,
                         })
-            print(f"[AudioForge] Clotho: {len(self.examples)} examples (from {len(clotho)} clips)")
+            print(f"[Rhapsody] Clotho: {len(self.examples)} examples (from {len(clotho)} clips)")
         except Exception as e:
-            print(f"[AudioForge] Clotho load failed: {e}")
+            print(f"[Rhapsody] Clotho load failed: {e}")
 
         n_before = len(self.examples)
-        print("[AudioForge] Loading AudioSet captions (up to 2 000)...")
+        print("[Rhapsody] Loading AudioSet captions (up to 2 000)...")
         try:
             aset = load_dataset(
                 "EleutherAI/audio-captioning-the-typical-pca-audioset-eval",
@@ -218,11 +218,11 @@ class AudioTextDataset(Dataset):
                         "index": i,
                     })
                     count += 1
-            print(f"[AudioForge] AudioSet: {count} examples")
+            print(f"[Rhapsody] AudioSet: {count} examples")
         except Exception as e:
-            print(f"[AudioForge] AudioSet load failed: {e}")
+            print(f"[Rhapsody] AudioSet load failed: {e}")
 
-        print(f"[AudioForge] Audio-text dataset total: {len(self.examples)} examples")
+        print(f"[Rhapsody] Audio-text dataset total: {len(self.examples)} examples")
 
     def __len__(self) -> int:
         return len(self.examples)
@@ -270,7 +270,7 @@ class AudioTextDataset(Dataset):
                 # [1, 1, mel_bins, time_frames] → squeeze batch dim → [1, mel_bins, time_frames]
                 audio_features = feats.input_features.squeeze(0)
             except Exception as e:
-                print(f"[AudioForge] WARNING: audio processing failed for idx={idx}: {e}")
+                print(f"[Rhapsody] WARNING: audio processing failed for idx={idx}: {e}")
                 audio_features = torch.zeros(1, 64, 1001)   # CLAP silence fallback
         else:
             audio_features = torch.zeros(1, 64, 1001)
@@ -297,7 +297,7 @@ class SymbolicMusicDataset(Dataset):
       - prompt field: optional textual control prompt
       - audio_path field: optional path for audio conditioning
 
-    Returns pre-shifted labels, consistent with other AudioForge datasets.
+    Returns pre-shifted labels, consistent with other Rhapsody datasets.
     """
 
     _SYMBOLIC_FIELD_CANDIDATES = (
@@ -339,7 +339,7 @@ class SymbolicMusicDataset(Dataset):
             ds_name = hf_dataset or "Seeker38/music_abc_notation"
             self._load_hf_dataset(ds_name, hf_split, max_examples=max_examples)
 
-        print(f"[AudioForge] Symbolic dataset total: {len(self.examples)} examples")
+        print(f"[Rhapsody] Symbolic dataset total: {len(self.examples)} examples")
 
     def _resolve_symbolic_field(self, sample: dict) -> Optional[str]:
         if self.symbolic_field is not None and self.symbolic_field in sample:
@@ -353,7 +353,7 @@ class SymbolicMusicDataset(Dataset):
         return None
 
     def _load_local_jsonl(self, path: Path, max_examples: Optional[int]) -> None:
-        print(f"[AudioForge] Loading symbolic JSONL: {path}")
+        print(f"[Rhapsody] Loading symbolic JSONL: {path}")
         if not path.exists():
             raise FileNotFoundError(f"Symbolic dataset path not found: {path}")
 
@@ -379,10 +379,10 @@ class SymbolicMusicDataset(Dataset):
                     }
                 )
                 if (i + 1) % 10000 == 0:
-                    print(f"[AudioForge] Parsed {i + 1} lines...")
+                    print(f"[Rhapsody] Parsed {i + 1} lines...")
 
     def _load_hf_dataset(self, name: str, split: str, max_examples: Optional[int]) -> None:
-        print(f"[AudioForge] Loading symbolic HF dataset: {name} [{split}]")
+        print(f"[Rhapsody] Loading symbolic HF dataset: {name} [{split}]")
         ds = load_dataset(name, split=split, streaming=True)
         for row in ds:
             if max_examples is not None and len(self.examples) >= max_examples:
@@ -425,7 +425,7 @@ class SymbolicMusicDataset(Dataset):
             )
             return feats.input_features.squeeze(0)
         except Exception as e:
-            print(f"[AudioForge] WARNING: failed to load or process audio from {audio_path}: {e}")
+            print(f"[Rhapsody] WARNING: failed to load or process audio from {audio_path}: {e}")
             return None
 
     def __getitem__(self, idx: int) -> dict:

@@ -1,4 +1,4 @@
-"""ABC notation ↔ MIDI conversion utilities for AudioForge symbolic music generation."""
+"""ABC notation ↔ MIDI conversion utilities for Rhapsody symbolic music generation."""
 
 from __future__ import annotations
 
@@ -125,7 +125,7 @@ def render_abc_to_audio(
         ]
         soundfont = next((s for s in soundfont_candidates if Path(s).exists()), None)
         if soundfont is None:
-            print("[AudioForge] WARNING: No SoundFont found; cannot render audio via fluidsynth.")
+            print("[Rhapsody] WARNING: No SoundFont found; cannot render audio via fluidsynth.")
             return False
 
         audio_result = subprocess.run(
