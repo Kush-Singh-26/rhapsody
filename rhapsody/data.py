@@ -70,9 +70,8 @@ class TextPretrainDataset(IterableDataset):
         self,
         tokenizer: AutoTokenizer,
         seq_len: int = 2048,
-        fineweb_ratio: float = 0.55,
+        fineweb_ratio: float = 0.70,
         dclm_ratio: float = 0.25,
-        stack_edu_ratio: float = 0.15,
         cosmopedia_ratio: float = 0.05,
     ):
         self.tokenizer = tokenizer
@@ -92,11 +91,6 @@ class TextPretrainDataset(IterableDataset):
                             split="train", streaming=True)
         datasets_list.append(dclm)
         weights.append(dclm_ratio)
-
-        print("[Rhapsody] Loading Stack-Edu...")
-        stack = load_dataset("HuggingFaceTB/stack-edu", split="train", streaming=True)
-        datasets_list.append(stack)
-        weights.append(stack_edu_ratio)
 
         print("[Rhapsody] Loading Cosmopedia v2...")
         cosmo = load_dataset("HuggingFaceTB/cosmopedia-v2", split="train", streaming=True)
