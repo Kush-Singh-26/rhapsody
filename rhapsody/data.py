@@ -93,12 +93,12 @@ class TextPretrainDataset(IterableDataset):
         weights.append(dclm_ratio)
 
         print("[Rhapsody] Loading Cosmopedia v2...")
-        cosmo = load_dataset("HuggingFaceTB/cosmopedia-v2", split="train", streaming=True)
+        cosmo = load_dataset("HuggingFaceTB/cosmopedia-v2", name="cosmopedia-v2", split="train", streaming=True)
         datasets_list.append(cosmo)
         weights.append(cosmopedia_ratio)
 
         self.dataset = interleave_datasets(
-            datasets_list, weights=weights, stopping_strategy="all_exhausted"
+            datasets_list, probabilities=weights, stopping_strategy="all_exhausted"
         )
 
     def __iter__(self):
