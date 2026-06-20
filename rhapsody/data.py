@@ -175,6 +175,7 @@ class AudioTextDataset(Dataset):
 
         print(f"[Rhapsody] Loading Clotho ({clotho_split} split)...")
         try:
+            import re
             # Map soundata/clotho split names to CLAPv2/Clotho split names
             clotho_split_map = {
                 "development": "train",
@@ -183,13 +184,57 @@ class AudioTextDataset(Dataset):
             }
             clotho_hf_split = clotho_split_map.get(clotho_split, clotho_split)
 
+            def split_clotho_captions(text_str):
+                parts = [p.strip() for p in re.split(r'\.\s+', text_str) if p.strip()]
+                if len(parts) == 5:
+                    return parts
+                if len(parts) < 5:
+                    new_parts = []
+                    for p in parts:
+                        if len(new_parts) + (len(parts) - len(new_parts)) < 5:
+                            subparts = [sp.strip() for sp in re.split(r'\s+(?=[A-Z])', p) if sp.strip()]
+                            new_parts.extend(subparts)
+                        else:
+                            new_parts.append(p)
+                    parts = new_parts
+                if len(parts) < 5:
+                    new_parts = []
+                    for p in parts:
+                        subparts = [sp.strip() for sp in re.split(r'\s+(?=[A-Z])', p) if sp.strip()]
+                        new_parts.extend(subparts)
+                    parts = new_parts
+                while len(parts) > 5:
+                    min_idx = -1
+                    min_len = 999999
+                    for idx_p, p in enumerate(parts):
+                        if len(p) < min_len:
+                            min_len = len(p)
+                            min_idx = idx_p
+                    if min_idx == 0:
+                        parts[0] = parts[0] + ' ' + parts[1]
+                        parts.pop(1)
+                    elif min_idx == len(parts) - 1:
+                        parts[min_idx - 1] = parts[min_idx - 1] + ' ' + parts[min_idx]
+                        parts.pop(min_idx)
+                    else:
+                        if len(parts[min_idx - 1]) < len(parts[min_idx + 1]):
+                            parts[min_idx - 1] = parts[min_idx - 1] + ' ' + parts[min_idx]
+                            parts.pop(min_idx)
+                        else:
+                            parts[min_idx] = parts[min_idx] + ' ' + parts[min_idx + 1]
+                            parts.pop(min_idx + 1)
+                return parts
+
             # CLAPv2/Clotho is public and contains audio bytes natively
             clotho = load_dataset("CLAPv2/Clotho", split=clotho_hf_split)
             self._datasets["clotho"] = clotho
             for i, item in enumerate(clotho):
-                raw_text_list = item.get("raw_text") or []
-                for text in raw_text_list:
+                text_field = item.get("text", "")
+                captions = split_clotho_captions(text_field)
+                for text in captions:
                     if text and len(text) > 20:
+                        if not text.endswith('.'):
+                            text += '.'
                         self.examples.append({
                             "text": text,
                             "source": "clotho",

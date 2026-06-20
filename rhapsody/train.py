@@ -403,10 +403,18 @@ def train():
         try:
             import wandb
             import hashlib
+            import os
+            # If wandb is installed, default to disabled mode unless explicitly configured
+            # via WANDB_API_KEY or WANDB_MODE env vars to prevent blocking in notebooks.
+            if not os.environ.get("WANDB_API_KEY") and not os.environ.get("WANDB_MODE"):
+                os.environ["WANDB_MODE"] = "disabled"
+                print("[Rhapsody] wandb unconfigured: defaulting to disabled mode to prevent interactive prompts.")
+            
             run_id = hashlib.md5(str(Path(args.output_dir).resolve()).encode()).hexdigest()[:8]
             wandb.init(project="rhapsody", config=vars(args), resume="allow", id=f"rhapsody-{args.stage}-{run_id}")
-            use_wandb = True
-        except ImportError:
+            use_wandb = wandb.run is not None
+        except Exception as e:
+            print(f"[Rhapsody] WARNING: wandb initialization failed or disabled: {e}")
             use_wandb = False
 
     torch.manual_seed(args.seed)
