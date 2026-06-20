@@ -1,0 +1,32 @@
+name: "rhapsody-65m"
+state:
+  repo_id: "Kush26/rhapsody-65m-checkpoints"
+  branch: "checkpoints"
+  checkpoint_limit: 3
+  push_every: 500
+  private: true
+
+providers:
+  modal:
+    gpu: "A100"
+    gpu_count: 1
+    cpu: 16
+    memory: 65536
+    timeout: 86400
+
+profiles:
+  colab:
+    per_device_train_batch_size: 2
+    gradient_accumulation_steps: 16
+    learning_rate: 0.0008
+    probe_memory: false
+    data_cache: false
+  modal:
+    per_device_train_batch_size: 16
+    gradient_accumulation_steps: 32
+    learning_rate: 0.015
+    data_cache: true
+  local:
+    per_device_train_batch_size: 2
+    gradient_accumulation_steps: 8
+    learning_rate: 0.001
