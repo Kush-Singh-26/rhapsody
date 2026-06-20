@@ -609,11 +609,18 @@ def train():
             model.load_state_dict(state_dict)
             start_step = ckpt.get("step", 0)
             if "rng_state" in ckpt:
-                torch.set_rng_state(ckpt["rng_state"].cpu())
+                try:
+                    torch.set_rng_state(ckpt["rng_state"].cpu().byte())
+                except Exception as e:
+                    print(f"[Rhapsody] WARNING: Failed to restore CPU RNG state: {e}")
             if "python_random_state" in ckpt:
                 random.setstate(ckpt["python_random_state"])
             if torch.cuda.is_available() and "cuda_rng_state_all" in ckpt:
-                torch.cuda.set_rng_state_all(ckpt["cuda_rng_state_all"])
+                try:
+                    rng_states = [s.cpu().byte() if isinstance(s, torch.Tensor) else s for s in ckpt["cuda_rng_state_all"]]
+                    torch.cuda.set_rng_state_all(rng_states)
+                except Exception as e:
+                    print(f"[Rhapsody] WARNING: Failed to restore CUDA RNG state: {e}")
             print(f"[Rhapsody] Resumed at step {start_step}")
         if opt_pt.exists():
             opt_ckpt = torch.load(opt_pt, map_location=device, weights_only=True)
