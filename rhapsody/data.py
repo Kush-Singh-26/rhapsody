@@ -181,13 +181,20 @@ class AudioTextDataset(Dataset):
 
         print(f"[Rhapsody] Loading Clotho ({clotho_split} split)...")
         try:
-            # Clotho is open access and houses audio bytes natively in HF dataset cache
-            clotho = load_dataset("soundata/clotho", split=clotho_split)
+            # Map soundata/clotho split names to CLAPv2/Clotho split names
+            clotho_split_map = {
+                "development": "train",
+                "validation": "validation",
+                "evaluation": "test"
+            }
+            clotho_hf_split = clotho_split_map.get(clotho_split, clotho_split)
+
+            # CLAPv2/Clotho is public and contains audio bytes natively
+            clotho = load_dataset("CLAPv2/Clotho", split=clotho_hf_split)
             self._datasets["clotho"] = clotho
             for i, item in enumerate(clotho):
-                # Clotho has 5 human captions: caption_1 to caption_5. Add them all to leverage rich details!
-                for k in ["caption_1", "caption_2", "caption_3", "caption_4", "caption_5"]:
-                    text = item.get(k, "")
+                raw_text_list = item.get("raw_text") or []
+                for text in raw_text_list:
                     if text and len(text) > 20:
                         self.examples.append({
                             "text": text,
@@ -197,30 +204,6 @@ class AudioTextDataset(Dataset):
             print(f"[Rhapsody] Clotho: {len(self.examples)} examples (from {len(clotho)} clips)")
         except Exception as e:
             print(f"[Rhapsody] Clotho load failed: {e}")
-
-        n_before = len(self.examples)
-        print("[Rhapsody] Loading AudioSet captions (up to 2 000)...")
-        try:
-            aset = load_dataset(
-                "EleutherAI/audio-captioning-the-typical-pca-audioset-eval",
-                split="train",
-            )
-            self._datasets["audioset"] = aset
-            count = 0
-            for i, item in enumerate(aset):
-                if count >= 2000:
-                    break
-                text = item.get("caption", "")
-                if text and len(text) > 20:
-                    self.examples.append({
-                        "text": text,
-                        "source": "audioset",
-                        "index": i,
-                    })
-                    count += 1
-            print(f"[Rhapsody] AudioSet: {count} examples")
-        except Exception as e:
-            print(f"[Rhapsody] AudioSet load failed: {e}")
 
         print(f"[Rhapsody] Audio-text dataset total: {len(self.examples)} examples")
 
@@ -251,11 +234,6 @@ class AudioTextDataset(Dataset):
         if example["source"] == "clotho":
             # HuggingFace Arrow dataset supports O(1) random access — no RAM spike
             row = self._datasets["clotho"][example["index"]]
-            audio = row.get("audio") or {}
-            audio_array = audio.get("array")
-            sampling_rate = audio.get("sampling_rate", 48000)
-        elif example["source"] == "audioset":
-            row = self._datasets["audioset"][example["index"]]
             audio = row.get("audio") or {}
             audio_array = audio.get("array")
             sampling_rate = audio.get("sampling_rate", 48000)

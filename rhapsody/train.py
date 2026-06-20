@@ -518,29 +518,36 @@ def train():
     covered_ids = {id(p) for p in muon_params + adamw_decay_params + adamw_no_decay_params}
     assert covered_ids == all_ids, f"Param coverage mismatch! {len(all_ids ^ covered_ids)} params uncovered."
 
-    optimizer = Muon(
-        muon_params,
-        lr=args.muon_lr, momentum=0.95, nesterov=True, ns_steps=5,
-        adamw_params=None,  # We add AdamW groups manually below
-    )
+    if not muon_params:
+        print("[Rhapsody] No Muon parameters detected (frozen text LM). Falling back to standard AdamW optimizer.")
+        optimizer = torch.optim.AdamW([
+            {"params": adamw_decay_params, "weight_decay": 0.1, "lr": args.lr, "betas": (0.9, 0.95)},
+            {"params": adamw_no_decay_params, "weight_decay": 0.0, "lr": args.lr, "betas": (0.9, 0.95)}
+        ])
+    else:
+        optimizer = Muon(
+            muon_params,
+            lr=args.muon_lr, momentum=0.95, nesterov=True, ns_steps=5,
+            adamw_params=None,  # We add AdamW groups manually below
+        )
 
-    # Add AdamW decay group
-    optimizer.add_param_group({
-        "params": adamw_decay_params,
-        "lr": args.lr,
-        "betas": (0.9, 0.95),
-        "weight_decay": 0.1,
-        "is_adamw": True,
-    })
+        # Add AdamW decay group
+        optimizer.add_param_group({
+            "params": adamw_decay_params,
+            "lr": args.lr,
+            "betas": (0.9, 0.95),
+            "weight_decay": 0.1,
+            "is_adamw": True,
+        })
 
-    # Add AdamW no-decay group
-    optimizer.add_param_group({
-        "params": adamw_no_decay_params,
-        "lr": args.lr,
-        "betas": (0.9, 0.95),
-        "weight_decay": 0.0,
-        "is_adamw": True,
-    })
+        # Add AdamW no-decay group
+        optimizer.add_param_group({
+            "params": adamw_no_decay_params,
+            "lr": args.lr,
+            "betas": (0.9, 0.95),
+            "weight_decay": 0.0,
+            "is_adamw": True,
+        })
 
     # ── LR Scheduler ─────────────────────────────────────────────────────────
     # Use WSD for Stage 1 pretraining; Cosine Decay with Warmup for Stage 2 & 3
