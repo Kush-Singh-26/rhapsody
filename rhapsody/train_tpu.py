@@ -627,7 +627,41 @@ def train():
             print(f"[Rhapsody] Resumed at step {start_step}")
         if opt_pt.exists():
             opt_ckpt = torch.load(opt_pt, map_location="cpu", weights_only=True)
-            optimizer.load_state_dict(opt_ckpt["optimizer"])
+            saved_state_dict = opt_ckpt["optimizer"]
+            try:
+                # Collect all parameters from saved groups
+                saved_param_ids = []
+                for group in saved_state_dict["param_groups"]:
+                    saved_param_ids.extend(group["params"])
+                
+                # Collect all parameters from active optimizer
+                active_params = []
+                for group in optimizer.param_groups:
+                    active_params.extend(group["params"])
+                
+                if len(saved_param_ids) == len(active_params):
+                    print("[Rhapsody] Aligning optimizer state dict parameter groups...")
+                    new_state = {}
+                    for active_p, saved_pid in zip(active_params, saved_param_ids):
+                        if saved_pid in saved_state_dict["state"]:
+                            new_state[active_p] = {
+                                k: (v.to(active_p.device) if torch.is_tensor(v) else v)
+                                for k, v in saved_state_dict["state"][saved_pid].items()
+                            }
+                    optimizer.state.clear()
+                    optimizer.state.update(new_state)
+                    
+                    # Restore Muon step counter if present
+                    if "_adam_step" in saved_state_dict:
+                        optimizer._adam_step = saved_state_dict["_adam_step"]
+                    
+                    print("[Rhapsody] Optimizer state aligned and loaded successfully.")
+                else:
+                    print(f"[Rhapsody] WARNING: Optimizer parameter count mismatch: saved has {len(saved_param_ids)}, active has {len(active_params)}. Fallback to standard load.")
+                    optimizer.load_state_dict(saved_state_dict)
+            except Exception as e:
+                print(f"[Rhapsody] WARNING: Failed to dynamically align optimizer state dict: {e}. Falling back to standard loading.")
+                optimizer.load_state_dict(saved_state_dict)
         if sched_pt.exists():
             print(f"[Rhapsody] Loading scheduler state from {sched_pt}")
             sched_ckpt = torch.load(sched_pt, map_location="cpu", weights_only=True)
