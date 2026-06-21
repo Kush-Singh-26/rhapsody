@@ -596,7 +596,7 @@ def train():
         sched_pt = ckpt_path / "scheduler.pt"
         if model_pt.exists():
             print(f"[Rhapsody] Resuming from {ckpt_path}")
-            ckpt = torch.load(model_pt, map_location=device, weights_only=True)
+            ckpt = torch.load(model_pt, map_location="cpu", weights_only=True)
             # Support both wrapped and unwrapped checkpoints
             state_dict = ckpt["model"]
             if any(k.startswith("module.") for k in state_dict):
@@ -624,11 +624,11 @@ def train():
                     print(f"[Rhapsody] WARNING: Failed to restore XLA RNG state: {e}")
             print(f"[Rhapsody] Resumed at step {start_step}")
         if opt_pt.exists():
-            opt_ckpt = torch.load(opt_pt, map_location=device, weights_only=True)
+            opt_ckpt = torch.load(opt_pt, map_location="cpu", weights_only=True)
             optimizer.load_state_dict(opt_ckpt["optimizer"])
         if sched_pt.exists():
             print(f"[Rhapsody] Loading scheduler state from {sched_pt}")
-            sched_ckpt = torch.load(sched_pt, map_location=device, weights_only=True)
+            sched_ckpt = torch.load(sched_pt, map_location="cpu", weights_only=True)
             scheduler.load_state_dict(sched_ckpt["scheduler"])
         else:
             # Fallback if scheduler state is missing: set last_epoch manually
