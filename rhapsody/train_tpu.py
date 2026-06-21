@@ -523,10 +523,11 @@ def train():
 
     if not muon_params:
         print("[Rhapsody] No Muon parameters detected (frozen text LM). Falling back to standard AdamW optimizer.")
-        optimizer = torch.optim.AdamW([
-            {"params": adamw_decay_params, "weight_decay": 0.1, "lr": args.lr, "betas": (0.9, 0.95)},
-            {"params": adamw_no_decay_params, "weight_decay": 0.0, "lr": args.lr, "betas": (0.9, 0.95)}
-        ])
+        groups = []
+        if adamw_decay_params:
+            groups.append({"params": adamw_decay_params, "weight_decay": 0.1, "lr": args.lr, "betas": (0.9, 0.95)})
+        groups.append({"params": adamw_no_decay_params, "weight_decay": 0.0, "lr": args.lr, "betas": (0.9, 0.95)})
+        optimizer = torch.optim.AdamW(groups)
     else:
         optimizer = Muon(
             muon_params,
@@ -534,14 +535,15 @@ def train():
             adamw_params=None,  # We add AdamW groups manually below
         )
 
-        # Add AdamW decay group
-        optimizer.add_param_group({
-            "params": adamw_decay_params,
-            "lr": args.lr,
-            "betas": (0.9, 0.95),
-            "weight_decay": 0.1,
-            "is_adamw": True,
-        })
+        # Add AdamW decay group only if parameters are present (Stage 2/3)
+        if adamw_decay_params:
+            optimizer.add_param_group({
+                "params": adamw_decay_params,
+                "lr": args.lr,
+                "betas": (0.9, 0.95),
+                "weight_decay": 0.1,
+                "is_adamw": True,
+            })
 
         # Add AdamW no-decay group
         optimizer.add_param_group({
