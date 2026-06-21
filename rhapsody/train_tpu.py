@@ -489,6 +489,16 @@ def train():
         model.text_lm.config.gradient_checkpointing = args.grad_checkpoint
         model = model.to(device)
 
+    def tie_weights(model: nn.Module) -> None:
+        if hasattr(model, "config") and getattr(model.config, "tie_word_embeddings", False):
+            if hasattr(model, "lm_head") and hasattr(model, "embed_tokens"):
+                model.lm_head.weight = model.embed_tokens.weight
+                print("[Rhapsody] Explicitly tied TextLM word embeddings on device.")
+        if hasattr(model, "text_lm"):
+            tie_weights(model.text_lm)
+
+    tie_weights(model)
+
     # ── Optimizer ────────────────────────────────────────────────────────────
     # 1. Muon parameters: 2D+ weight matrices for Attention/FFN projections inside text LM.
     #    Excludes embeddings, lm_head, projector (AudioProjector), and norm scales (per-head scalars).
