@@ -582,24 +582,29 @@ def train():
     # ── Output directory ─────────────────────────────────────────────────────
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    hub_manager = init_forge_hub(args.forge_config)
+    # Only initialize the Hub manager on the main process to avoid concurrent HF API requests
+    hub_manager = None
+    if accelerator.is_main_process:
+        hub_manager = init_forge_hub(args.forge_config)
 
     # ── Resume from checkpoint ────────────────────────────────────────────────
     start_step = 0
     if args.auto_resume and args.resume is None:
+        # Step 1: Main process pulls the latest checkpoint from Hub if not locally available
+        if accelerator.is_main_process and hub_manager is not None:
+            latest_local = find_latest_checkpoint(output_dir)
+            if latest_local is None:
+                pulled = hub_manager.pull_latest(output_dir)
+                if pulled is not None:
+                    print(f"[Rhapsody] Pulled latest checkpoint from Hub: {pulled}")
+
+        # Step 2: Unconditionally wait for everyone so all subprocesses sync after download completes
+        accelerator.wait_for_everyone()
+
+        # Step 3: All processes scan the local directory and find the downloaded/existing checkpoint
         latest_local = find_latest_checkpoint(output_dir)
         if latest_local is not None:
             args.resume = str(latest_local)
-        elif hub_manager is not None:
-            if accelerator.is_main_process:
-                pulled = hub_manager.pull_latest(output_dir)
-                if pulled is not None:
-                    args.resume = str(pulled)
-            # Sync the resume path status to all ranks
-            accelerator.wait_for_everyone()
-            latest_local = find_latest_checkpoint(output_dir)
-            if latest_local is not None:
-                args.resume = str(latest_local)
 
     if args.resume:
         ckpt_path = Path(args.resume)
