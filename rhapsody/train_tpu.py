@@ -809,13 +809,17 @@ def train():
                 batch_audio_tokens = (64 * batch["input_ids"].shape[0]) if "audio_features" in batch else 0
                 tokens_in_window += (batch_text_tokens + batch_audio_tokens)
 
+                print(f"[Rhapsody] Process {accelerator.process_index} running clip_grad_norm...")
                 grad_norm_val = 0.0
                 if accelerator.sync_gradients:
                     grad_norm = accelerator.clip_grad_norm_(model.parameters(), 1.0)
                     if grad_norm is not None:
                         grad_norm_val = grad_norm.item()
+                print(f"[Rhapsody] Process {accelerator.process_index} clip_grad_norm completed. GradNorm: {grad_norm_val}")
 
+                print(f"[Rhapsody] Process {accelerator.process_index} running optimizer.step...")
                 optimizer.step()
+                print(f"[Rhapsody] Process {accelerator.process_index} optimizer.step completed.")
 
                 if accelerator.sync_gradients:
                     if not accelerator.optimizer_step_was_skipped:
