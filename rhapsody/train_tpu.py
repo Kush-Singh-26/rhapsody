@@ -877,7 +877,6 @@ def train():
     # All 8 ranks write here because accelerator.print() only shows rank 0.
     # If a rank hangs at sync(), its log will show the last batch-fetch line
     # but never the "sync DONE" line, pinpointing the deadlock exactly.
-    import sys
     _rlog_path = output_dir / f"rank_{accelerator.process_index}_train.log"
     _rlog_fh = open(_rlog_path, "w", buffering=1)
     def _rlog(msg: str):
