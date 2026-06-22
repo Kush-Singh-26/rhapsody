@@ -331,6 +331,12 @@ def save_checkpoint(
     }
     if torch.cuda.is_available():
         payload["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
+    elif accelerator.device.type == "xla":
+        try:
+            import torch_xla.core.xla_model as xm
+            payload["xla_rng_state"] = xm.get_rng_state()
+        except ImportError:
+            pass
     
     accelerator.save(payload, ckpt_dir / "model.pt")
     accelerator.save({"optimizer": optimizer.state_dict()}, ckpt_dir / "optimizer.pt")
@@ -624,6 +630,12 @@ def train():
                     torch.cuda.set_rng_state_all(rng_states)
                 except Exception as e:
                     print(f"[Rhapsody] WARNING: Failed to restore CUDA RNG state: {e}")
+            elif device.type == "xla" and "xla_rng_state" in ckpt:
+                try:
+                    import torch_xla.core.xla_model as xm
+                    xm.set_rng_state(ckpt["xla_rng_state"])
+                except Exception as e:
+                    print(f"[Rhapsody] WARNING: Failed to restore XLA RNG state: {e}")
             print(f"[Rhapsody] Resumed at step {start_step}")
         if opt_pt.exists():
             opt_ckpt = torch.load(opt_pt, map_location="cpu", weights_only=True)
@@ -767,8 +779,33 @@ def train():
                 loss = compute_loss(model, batch, device)
                 accelerator.backward(loss)
 
-                # Get the local loss value (detaching avoids keeping graph references)
-                loss_val = loss.detach().item()
+                # Keep loss as a local TPU tensor (do not call .item() here)
+                loss_val_tensor = loss.detach()
+
+                grad_norm_tensor = None
+                if accelerator.sync_gradients:
+                    grad_norm = accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                    if grad_norm is not None:
+                        grad_norm_tensor = grad_norm.detach()
+
+                optimizer.step()
+
+                if accelerator.sync_gradients:
+                    if not accelerator.optimizer_step_was_skipped:
+                        scheduler.step()
+                        step += 1
+                    else:
+                        print("  [Rhapsody] Warning: Gradient overflow detected, skipping optimizer step.")
+
+                optimizer.zero_grad(set_to_none=True)
+
+                # Unify the XLA graph execution at the end of the step
+                if device.type == "xla":
+                    import torch_xla.core.xla_model as xm
+                    xm.mark_step()
+
+                # NOW retrieve scalar values to the CPU safely after mark_step
+                loss_val = loss_val_tensor.item()
                 running_loss += loss_val
                 micro_steps_in_window += 1
 
@@ -778,22 +815,11 @@ def train():
                 tokens_in_window += (batch_text_tokens + batch_audio_tokens)
 
                 grad_norm_val = 0.0
-                if accelerator.sync_gradients:
-                    grad_norm = accelerator.clip_grad_norm_(model.parameters(), 1.0)
-                    if grad_norm is not None:
-                        grad_norm_val = grad_norm.item()
+                if grad_norm_tensor is not None:
+                    grad_norm_val = grad_norm_tensor.item()
 
-                optimizer.step()
-
-                if accelerator.sync_gradients:
-                    if not accelerator.optimizer_step_was_skipped:
-                        scheduler.step()
-                        step += 1
-                        running_grad_norm += grad_norm_val
-                    else:
-                        print("  [Rhapsody] Warning: Gradient overflow detected, skipping optimizer step.")
-
-                optimizer.zero_grad(set_to_none=True)
+                if accelerator.sync_gradients and not accelerator.optimizer_step_was_skipped:
+                    running_grad_norm += grad_norm_val
 
                 # ── Logging ──────────────────────────────────────────────────────
                 if step > 0 and step % args.log_steps == 0 and accelerator.sync_gradients and not accelerator.optimizer_step_was_skipped:
@@ -831,8 +857,10 @@ def train():
                 # ── Checkpointing ─────────────────────────────────────────────────
                 if step > 0 and step % args.save_steps == 0 and accelerator.sync_gradients and not accelerator.optimizer_step_was_skipped:
                     ckpt_dir = output_dir / f"checkpoint-{step}"
+                    # Must call save_checkpoint on all processes to avoid TPU checkpoint saving deadlocks
+                    save_checkpoint(ckpt_dir, model, optimizer, scheduler, step, accelerator)
+                    
                     if accelerator.is_main_process:
-                        save_checkpoint(ckpt_dir, model, optimizer, scheduler, step, accelerator)
                         print(f"  Checkpoint saved: {ckpt_dir}")
 
                         # Keep latest 3 checkpoints locally to save disk space
@@ -874,16 +902,17 @@ def train():
     accelerator.wait_for_everyone()
     print("[Rhapsody] Training complete!")
     final_dir = output_dir / "final"
+    final_dir.mkdir(parents=True, exist_ok=True)
+    unwrapped_model = accelerator.unwrap_model(model)
+    raw_model = getattr(unwrapped_model, "_orig_mod", unwrapped_model)
+    # Must save on all processes to participate in XLA save synchronization
+    accelerator.save(
+        {"model": raw_model.state_dict(),
+         "config": raw_model.config.to_config_dict()
+         if hasattr(raw_model, "config") else {}},
+        final_dir / "model.pt",
+    )
     if accelerator.is_main_process:
-        final_dir.mkdir(parents=True, exist_ok=True)
-        unwrapped_model = accelerator.unwrap_model(model)
-        raw_model = getattr(unwrapped_model, "_orig_mod", unwrapped_model)
-        torch.save(
-            {"model": raw_model.state_dict(),
-             "config": raw_model.config.to_config_dict()
-             if hasattr(raw_model, "config") else {}},
-            final_dir / "model.pt",
-        )
         print(f"[Rhapsody] Final model saved to {final_dir}")
 
 

@@ -784,23 +784,41 @@ def train():
 
     print(f"[Rhapsody] Process {accelerator.process_index} starting training loop...")
     while step < total_steps:
-        print(f"[Rhapsody] Process {accelerator.process_index} waiting for next batch from dataloader...")
         for batch in dataloader:
-            print(f"[Rhapsody] Process {accelerator.process_index} successfully fetched batch.")
             if step >= total_steps:
                 break
 
             with accelerator.accumulate(model):
-                print(f"[Rhapsody] Process {accelerator.process_index} running forward pass...")
                 loss = compute_loss(model, batch, device)
-                print(f"[Rhapsody] Process {accelerator.process_index} forward pass completed. Loss: {loss.item()}")
-                
-                print(f"[Rhapsody] Process {accelerator.process_index} running backward pass...")
                 accelerator.backward(loss)
-                print(f"[Rhapsody] Process {accelerator.process_index} backward pass completed.")
 
-                # Get the local loss value (detaching avoids keeping graph references)
-                loss_val = loss.detach().item()
+                # Keep loss as a local TPU tensor (do not call .item() here)
+                loss_val_tensor = loss.detach()
+
+                grad_norm_tensor = None
+                if accelerator.sync_gradients:
+                    grad_norm = accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                    if grad_norm is not None:
+                        grad_norm_tensor = grad_norm.detach()
+
+                optimizer.step()
+
+                if accelerator.sync_gradients:
+                    if not accelerator.optimizer_step_was_skipped:
+                        scheduler.step()
+                        step += 1
+                    else:
+                        print("  [Rhapsody] Warning: Gradient overflow detected, skipping optimizer step.")
+
+                optimizer.zero_grad(set_to_none=True)
+
+                # Unify the XLA graph execution at the end of the step
+                if device.type == "xla":
+                    import torch_xla.core.xla_model as xm
+                    xm.mark_step()
+
+                # NOW retrieve scalar values to the CPU safely after mark_step
+                loss_val = loss_val_tensor.item()
                 running_loss += loss_val
                 micro_steps_in_window += 1
 
@@ -809,27 +827,12 @@ def train():
                 batch_audio_tokens = (64 * batch["input_ids"].shape[0]) if "audio_features" in batch else 0
                 tokens_in_window += (batch_text_tokens + batch_audio_tokens)
 
-                print(f"[Rhapsody] Process {accelerator.process_index} running clip_grad_norm...")
                 grad_norm_val = 0.0
-                if accelerator.sync_gradients:
-                    grad_norm = accelerator.clip_grad_norm_(model.parameters(), 1.0)
-                    if grad_norm is not None:
-                        grad_norm_val = grad_norm.item()
-                print(f"[Rhapsody] Process {accelerator.process_index} clip_grad_norm completed. GradNorm: {grad_norm_val}")
+                if grad_norm_tensor is not None:
+                    grad_norm_val = grad_norm_tensor.item()
 
-                print(f"[Rhapsody] Process {accelerator.process_index} running optimizer.step...")
-                optimizer.step()
-                print(f"[Rhapsody] Process {accelerator.process_index} optimizer.step completed.")
-
-                if accelerator.sync_gradients:
-                    if not accelerator.optimizer_step_was_skipped:
-                        scheduler.step()
-                        step += 1
-                        running_grad_norm += grad_norm_val
-                    else:
-                        print("  [Rhapsody] Warning: Gradient overflow detected, skipping optimizer step.")
-
-                optimizer.zero_grad(set_to_none=True)
+                if accelerator.sync_gradients and not accelerator.optimizer_step_was_skipped:
+                    running_grad_norm += grad_norm_val
 
                 # ── Logging ──────────────────────────────────────────────────────
                 if step > 0 and step % args.log_steps == 0 and accelerator.sync_gradients and not accelerator.optimizer_step_was_skipped:
