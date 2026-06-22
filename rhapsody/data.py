@@ -110,16 +110,18 @@ class TextPretrainDataset(IterableDataset):
         )
 
         # Shard the dataset across processes to prevent concurrent file lock conflicts
-        # and ensure each process processes different data.
+        # and ensure each process processes different data at the file/shard level.
         try:
             from accelerate import PartialState
             state = PartialState()
             if state.num_processes > 1:
-                self.dataset = self.dataset.shard(
-                    num_shards=state.num_processes,
-                    index=state.process_index
+                from datasets.distributed import split_dataset_by_node
+                self.dataset = split_dataset_by_node(
+                    self.dataset,
+                    rank=state.process_index,
+                    world_size=state.num_processes
                 )
-                print(f"[Rhapsody] Sharded dataset: process {state.process_index}/{state.num_processes}")
+                print(f"[Rhapsody] Sharded dataset at file level: process {state.process_index}/{state.num_processes}")
         except Exception as e:
             print(f"[Rhapsody] WARNING: Failed to shard dataset: {e}")
 
