@@ -12,6 +12,10 @@ if "LOCAL_RANK" in os.environ:
 if "LOCAL_WORLD_SIZE" in os.environ:
     os.environ["PJRT_LOCAL_WORLD_SIZE"] = os.environ["LOCAL_WORLD_SIZE"]
 
+# Clean up Kaggle default environment variables that conflict with single-host PJRT initialization
+os.environ.pop("TPU_PROCESS_ADDRESSES", None)
+os.environ.pop("CLOUD_TPU_TASK_ID", None)
+
 import random
 import sys
 import time
