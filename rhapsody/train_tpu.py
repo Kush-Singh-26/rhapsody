@@ -785,8 +785,8 @@ def train():
                 loss = compute_loss(model, batch, device)
                 accelerator.backward(loss)
 
-                # Gather and average loss across ranks for logging
-                loss_val = accelerator.reduce(loss, "mean").item()
+                # Get the local loss value (detaching avoids keeping graph references)
+                loss_val = loss.detach().item()
                 running_loss += loss_val
                 micro_steps_in_window += 1
 
