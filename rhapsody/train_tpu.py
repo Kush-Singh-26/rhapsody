@@ -6,6 +6,7 @@ import contextlib
 import math
 import os
 import random
+import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -413,7 +414,6 @@ def train():
     # We need to know our rank. If running via accelerate, it sets LOCAL_RANK.
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     
-    import sys, time
     _slog_path = output_dir / f"rank_{local_rank}_setup.log"
     _slog_fh = open(_slog_path, "w", buffering=1)
     def _slog(msg: str):
@@ -437,7 +437,6 @@ def train():
         try:
             import wandb
             import hashlib
-            import os
             # If wandb is installed, default to disabled mode unless explicitly configured
             # via WANDB_API_KEY or WANDB_MODE env vars to prevent blocking in notebooks.
             if not os.environ.get("WANDB_API_KEY") and not os.environ.get("WANDB_MODE"):
