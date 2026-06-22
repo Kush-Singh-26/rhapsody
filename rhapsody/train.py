@@ -603,7 +603,16 @@ def train():
                 except Exception as e:
                     print(f"[Rhapsody] WARNING: Failed to restore CPU RNG state: {e}")
             if "python_random_state" in ckpt:
-                random.setstate(ckpt["python_random_state"])
+                try:
+                    random_state = ckpt["python_random_state"]
+                    if isinstance(random_state, list):
+                        version, state_vector, gauss_next = random_state
+                        if isinstance(state_vector, list):
+                            state_vector = tuple(state_vector)
+                        random_state = (version, state_vector, gauss_next)
+                    random.setstate(random_state)
+                except Exception as e:
+                    print(f"[Rhapsody] WARNING: Failed to restore Python random state: {e}")
             if torch.cuda.is_available() and "cuda_rng_state_all" in ckpt:
                 try:
                     rng_states = [s.cpu().byte() if isinstance(s, torch.Tensor) else s for s in ckpt["cuda_rng_state_all"]]
