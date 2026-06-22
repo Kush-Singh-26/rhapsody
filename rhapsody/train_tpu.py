@@ -5,6 +5,13 @@ from __future__ import annotations
 import contextlib
 import math
 import os
+
+# Map standard PyTorch distributed environment variables to PJRT variables for TPU v5e
+if "LOCAL_RANK" in os.environ:
+    os.environ["PJRT_LOCAL_RANK"] = os.environ["LOCAL_RANK"]
+if "LOCAL_WORLD_SIZE" in os.environ:
+    os.environ["PJRT_LOCAL_WORLD_SIZE"] = os.environ["LOCAL_WORLD_SIZE"]
+
 import random
 import sys
 import time
@@ -1085,25 +1092,4 @@ def train():
 
 
 if __name__ == "__main__":
-    is_tpu = False
-    try:
-        import torch_xla.core.xla_model as xm
-        is_tpu = True
-    except ImportError:
-        pass
-
-    # On TPU, if not launched via torchrun/accelerate (LOCAL_RANK missing), use xmp.spawn
-    if is_tpu and "LOCAL_RANK" not in os.environ:
-        import torch_xla.distributed.xmp as xmp
-        
-        # Determine number of TPU cores available (defaults to 8 on Kaggle v5e-8)
-        nprocs = int(os.environ.get("TPU_NUM_DEVICES", "8"))
-        
-        print(f"[Rhapsody] Auto-detected TPU without torchrun. Launching {nprocs} processes via xmp.spawn...")
-        
-        def _mp_fn(index):
-            train()
-            
-        xmp.spawn(_mp_fn, args=(), nprocs=nprocs, start_method='fork')
-    else:
-        train()
+    train()
