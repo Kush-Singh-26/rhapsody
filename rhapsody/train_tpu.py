@@ -749,9 +749,15 @@ def train():
     )
 
     # ── Prepare Accelerator ──────────────────────────────────────────────────
-    model, optimizer, dataloader, scheduler = accelerator.prepare(
-        model, optimizer, dataloader, scheduler
-    )
+    if isinstance(dataset, IterableDataset):
+        # Bypass wrapping the dataloader in MpDeviceLoader to avoid asynchronous prefetch deadlocks on TPU
+        model, optimizer, scheduler = accelerator.prepare(
+            model, optimizer, scheduler
+        )
+    else:
+        model, optimizer, dataloader, scheduler = accelerator.prepare(
+            model, optimizer, dataloader, scheduler
+        )
 
     # Note: torch.compile is intentionally called after accelerator.prepare.
     # The optimizer holds references to the original model parameters, and DDP wrappers
@@ -776,14 +782,22 @@ def train():
     micro_steps_in_window = 0
     window_start = time.time()
 
+    print(f"[Rhapsody] Process {accelerator.process_index} starting training loop...")
     while step < total_steps:
+        print(f"[Rhapsody] Process {accelerator.process_index} waiting for next batch from dataloader...")
         for batch in dataloader:
+            print(f"[Rhapsody] Process {accelerator.process_index} successfully fetched batch.")
             if step >= total_steps:
                 break
 
             with accelerator.accumulate(model):
+                print(f"[Rhapsody] Process {accelerator.process_index} running forward pass...")
                 loss = compute_loss(model, batch, device)
+                print(f"[Rhapsody] Process {accelerator.process_index} forward pass completed. Loss: {loss.item()}")
+                
+                print(f"[Rhapsody] Process {accelerator.process_index} running backward pass...")
                 accelerator.backward(loss)
+                print(f"[Rhapsody] Process {accelerator.process_index} backward pass completed.")
 
                 # Get the local loss value (detaching avoids keeping graph references)
                 loss_val = loss.detach().item()

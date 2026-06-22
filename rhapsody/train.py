@@ -725,9 +725,15 @@ def train():
     )
 
     # ── Prepare Accelerator ──────────────────────────────────────────────────
-    model, optimizer, dataloader, scheduler = accelerator.prepare(
-        model, optimizer, dataloader, scheduler
-    )
+    if isinstance(dataset, IterableDataset):
+        # Bypass wrapping the dataloader in MpDeviceLoader to avoid asynchronous prefetch deadlocks
+        model, optimizer, scheduler = accelerator.prepare(
+            model, optimizer, scheduler
+        )
+    else:
+        model, optimizer, dataloader, scheduler = accelerator.prepare(
+            model, optimizer, dataloader, scheduler
+        )
 
     # Note: torch.compile is intentionally called after accelerator.prepare.
     # The optimizer holds references to the original model parameters, and DDP wrappers
