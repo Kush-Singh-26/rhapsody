@@ -406,12 +406,31 @@ def train():
         major, _ = torch.cuda.get_device_capability()
         mixed_precision = "bf16" if major >= 8 else "fp16"
 
+    # ── Output directory & Per-rank SETUP diagnostic log ────────────────────
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # We need to know our rank. If running via accelerate, it sets LOCAL_RANK.
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    
+    import sys, time
+    _slog_path = output_dir / f"rank_{local_rank}_setup.log"
+    _slog_fh = open(_slog_path, "w", buffering=1)
+    def _slog(msg: str):
+        ts = time.strftime("%H:%M:%S")
+        _slog_fh.write(f"[{ts}][R{local_rank}] {msg}\n")
+        _slog_fh.flush()
+    _slog(f"=== Setup start | pid={os.getpid()} ===")
+
+    _slog("Initializing Accelerator...")
     accelerator = Accelerator(
         mixed_precision=mixed_precision,
         gradient_accumulation_steps=args.grad_accum
     )
     device = accelerator.device
     print = accelerator.print
+    _slog(f"Accelerator initialized. device={device}")
+
 
     use_wandb = False
     if accelerator.is_main_process:
@@ -578,23 +597,6 @@ def train():
         optimizer,
         lr_lambda=[lr_fn] * len(optimizer.param_groups),
     )
-
-    # ── Output directory ─────────────────────────────────────────────────────
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # ── Per-rank SETUP diagnostic log ────────────────────────────────────────
-    # Created immediately after output_dir so ALL ranks write here even if they
-    # crash before the training-loop log. If rank N's setup log is missing it is
-    # stuck in XLA/accelerate init BEFORE this point.
-    import sys, time
-    _slog_path = output_dir / f"rank_{accelerator.process_index}_setup.log"
-    _slog_fh = open(_slog_path, "w", buffering=1)
-    def _slog(msg: str):
-        ts = time.strftime("%H:%M:%S")
-        _slog_fh.write(f"[{ts}][R{accelerator.process_index}] {msg}\n")
-        _slog_fh.flush()
-    _slog(f"=== Setup start | device={device} | pid={os.getpid()} ===")
 
     # Only initialize the Hub manager on the main process to avoid concurrent HF API requests
     hub_manager = None
