@@ -85,6 +85,24 @@ class TextPretrainDataset(IterableDataset):
         # which takes hours for large resume steps on multi-process systems.
         docs_to_skip = 0
 
+        # Resolve distributed sharding info BEFORE loading datasets.
+        # CRITICAL: split_dataset_by_node must be applied to each sub-dataset INDIVIDUALLY
+        # before interleave_datasets. Applying it to the interleaved result does not properly
+        # expose file-level shards on all ranks, causing some ranks (1-7) to get empty or
+        # misaligned data. An empty dataset causes those ranks to skip the training loop
+        # body entirely, so they never call xm.sync(), and the DDP all_reduce in process 0
+        # blocks forever.
+        try:
+            from accelerate import PartialState
+            from datasets.distributed import split_dataset_by_node as _split_by_node
+            _dist_state = PartialState()
+            _rank = _dist_state.process_index
+            _world = _dist_state.num_processes
+        except Exception:
+            _rank = 0
+            _world = 1
+        _do_shard = _world > 1
+
         datasets_list = []
         weights = []
 
@@ -92,16 +110,22 @@ class TextPretrainDataset(IterableDataset):
 
         fw = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
         if docs_to_skip > 0: fw = fw.skip(int(docs_to_skip * fineweb_ratio))
+        if _do_shard:
+            fw = _split_by_node(fw, rank=_rank, world_size=_world)
         datasets_list.append(fw)
         weights.append(fineweb_ratio)
 
         dclm = load_dataset("mlfoundations/dclm-baseline-1.0", split="train", streaming=True)
         if docs_to_skip > 0: dclm = dclm.skip(int(docs_to_skip * dclm_ratio))
+        if _do_shard:
+            dclm = _split_by_node(dclm, rank=_rank, world_size=_world)
         datasets_list.append(dclm)
         weights.append(dclm_ratio)
 
         cosmo = load_dataset("HuggingFaceTB/cosmopedia-v2", name="cosmopedia-v2", split="train", streaming=True)
         if docs_to_skip > 0: cosmo = cosmo.skip(int(docs_to_skip * cosmopedia_ratio))
+        if _do_shard:
+            cosmo = _split_by_node(cosmo, rank=_rank, world_size=_world)
         datasets_list.append(cosmo)
         weights.append(cosmopedia_ratio)
 
@@ -109,21 +133,8 @@ class TextPretrainDataset(IterableDataset):
             datasets_list, probabilities=weights, stopping_strategy="all_exhausted"
         )
 
-        # Shard the dataset across processes to prevent concurrent file lock conflicts
-        # and ensure each process processes different data at the file/shard level.
-        try:
-            from accelerate import PartialState
-            state = PartialState()
-            if state.num_processes > 1:
-                from datasets.distributed import split_dataset_by_node
-                self.dataset = split_dataset_by_node(
-                    self.dataset,
-                    rank=state.process_index,
-                    world_size=state.num_processes
-                )
-                print(f"[Rhapsody] Sharded dataset at file level: process {state.process_index}/{state.num_processes}")
-        except Exception as e:
-            print(f"[Rhapsody] WARNING: Failed to shard dataset: {e}")
+        if _do_shard:
+            print(f"[Rhapsody] Sharded each sub-dataset independently before interleaving: rank {_rank}/{_world}")
 
     def __iter__(self):
         buffer: list[int] = []

@@ -815,15 +815,40 @@ def train():
     micro_steps_in_window = 0
     window_start = time.time()
 
+    # ── Per-rank diagnostic log file ─────────────────────────────────────────
+    # All 8 ranks write here because accelerator.print() only shows rank 0.
+    # If a rank hangs at sync(), its log will show the last batch-fetch line
+    # but never the "sync DONE" line, pinpointing the deadlock exactly.
+    import sys
+    _rlog_path = output_dir / f"rank_{accelerator.process_index}_train.log"
+    _rlog_fh = open(_rlog_path, "w", buffering=1)
+    def _rlog(msg: str):
+        ts = time.strftime("%H:%M:%S")
+        _rlog_fh.write(f"[{ts}][R{accelerator.process_index}] {msg}\n")
+        _rlog_fh.flush()
+
+    _rlog(f"=== Training start: step={step}, total_steps={total_steps}, device={device} ===")
+    _rlog(f"Dataset rank={accelerator.process_index}/{accelerator.num_processes}, "
+          f"batch_size={args.batch_size}, grad_accum={args.grad_accum}")
     print(f"[Rhapsody] Process {accelerator.process_index} starting training loop...")
+    print(f"[Rhapsody] Per-rank diagnostic logs: {output_dir}/rank_N_train.log")
     while step < total_steps:
         for batch in dataloader:
             if step >= total_steps:
                 break
 
+            _t_batch = time.time()  # batch fetch completed (we're now inside the loop)
+            batch_shape = tuple(batch["input_ids"].shape)
+            _rlog(f"step={step} | batch fetched {batch_shape} | fetch-to-loop: latency tracked externally")
+
+            _t0 = time.time()
             with accelerator.accumulate(model):
                 loss = compute_loss(model, batch, device)
+                _rlog(f"step={step} | forward DONE ({time.time()-_t0:.3f}s)")
+
+                _t1 = time.time()
                 accelerator.backward(loss)
+                _rlog(f"step={step} | backward DONE ({time.time()-_t1:.3f}s) -- all_reduce queued")
 
                 # Keep loss as a local TPU tensor (do not call .item() here)
                 loss_val_tensor = loss.detach()
@@ -834,7 +859,9 @@ def train():
                     if grad_norm is not None:
                         grad_norm_tensor = grad_norm.detach()
 
+                _t2 = time.time()
                 optimizer.step()
+                _rlog(f"step={step} | optimizer.step DONE ({time.time()-_t2:.3f}s)")
 
                 if accelerator.sync_gradients:
                     if not accelerator.optimizer_step_was_skipped:
@@ -845,13 +872,25 @@ def train():
 
                 optimizer.zero_grad(set_to_none=True)
 
-                # Unify the XLA graph execution at the end of the step
+                # Execute the XLA lazy graph.
+                # torch_xla.sync() (formerly xm.mark_step()) dispatches ALL queued ops
+                # including the DDP all_reduce. ALL 8 ranks must reach this call for the
+                # all_reduce to complete. If this line never returns, one or more other
+                # ranks are stuck in data loading and never queued their all_reduce op.
                 if device.type == "xla":
-                    import torch_xla.core.xla_model as xm
-                    xm.mark_step()
+                    _rlog(f"step={step} | calling torch_xla.sync() (blocks until all 8 ranks execute all_reduce)...")
+                    _t3 = time.time()
+                    try:
+                        import torch_xla
+                        torch_xla.sync()   # preferred API in torch_xla >= 2.x
+                    except AttributeError:
+                        import torch_xla.core.xla_model as xm
+                        xm.mark_step()     # fallback for older torch_xla
+                    _rlog(f"step={step} | torch_xla.sync() DONE ({time.time()-_t3:.3f}s) ✓")
 
-                # NOW retrieve scalar values to the CPU safely after mark_step
+                # NOW retrieve scalar values to the CPU safely after sync
                 loss_val = loss_val_tensor.item()
+                _rlog(f"step={step} | loss={loss_val:.4f} | step COMPLETE")
                 running_loss += loss_val
                 micro_steps_in_window += 1
 
@@ -941,11 +980,29 @@ def train():
                                 daemon=False  # Must be False so upload isn't killed if script exits
                             ).start()
                             
-                    # Wait for checkpointing and pruning to finish before rank 1 proceeds
-                    accelerator.wait_for_everyone()
+                    # XLA-safe barrier: avoid wait_for_everyone() which deadlocks before
+                    # prepare() is done or after it due to XLA collective timing issues.
+                    # File-based sentinel is safe for same-node filesystem.
+                    if device.type == "xla" and accelerator.num_processes > 1:
+                        import time as _t
+                        _ckpt_sentinel = output_dir / ".ckpt_sync_ready"
+                        if accelerator.is_main_process:
+                            _ckpt_sentinel.touch()
+                        else:
+                            _td = _t.time()
+                            while not _ckpt_sentinel.exists():
+                                if _t.time() - _td > 120: break
+                                _t.sleep(0.3)
+                        _t.sleep(1)
+                        if accelerator.is_main_process:
+                            _ckpt_sentinel.unlink(missing_ok=True)
+                    else:
+                        accelerator.wait_for_everyone()
+
+    _rlog("=== Training loop complete ===")
+    _rlog_fh.close()
 
     # ── Final save ─────────────────────────────────────────────────────────
-    accelerator.wait_for_everyone()
     print("[Rhapsody] Training complete!")
     final_dir = output_dir / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
