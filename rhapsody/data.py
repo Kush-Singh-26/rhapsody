@@ -109,6 +109,20 @@ class TextPretrainDataset(IterableDataset):
             datasets_list, probabilities=weights, stopping_strategy="all_exhausted"
         )
 
+        # Shard the dataset across processes to prevent concurrent file lock conflicts
+        # and ensure each process processes different data.
+        try:
+            from accelerate import PartialState
+            state = PartialState()
+            if state.num_processes > 1:
+                self.dataset = self.dataset.shard(
+                    num_shards=state.num_processes,
+                    index=state.process_index
+                )
+                print(f"[Rhapsody] Sharded dataset: process {state.process_index}/{state.num_processes}")
+        except Exception as e:
+            print(f"[Rhapsody] WARNING: Failed to shard dataset: {e}")
+
     def __iter__(self):
         buffer: list[int] = []
         eos_id = self.tokenizer.eos_token_id
