@@ -81,7 +81,9 @@ class TextPretrainDataset(IterableDataset):
 
         # Calculate approximate documents to skip (assuming ~1000 tokens per document)
         total_tokens_to_skip = resume_step * global_batch_size * seq_len
-        docs_to_skip = total_tokens_to_skip // 1000
+        # Bypassed: IterableDataset.skip(N) is an O(N) sequential download/discard operation
+        # which takes hours for large resume steps on multi-process systems.
+        docs_to_skip = 0
 
         datasets_list = []
         weights = []
