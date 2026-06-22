@@ -582,14 +582,31 @@ def train():
     # ── Output directory ─────────────────────────────────────────────────────
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Per-rank SETUP diagnostic log ────────────────────────────────────────
+    # Created immediately after output_dir so ALL ranks write here even if they
+    # crash before the training-loop log. If rank N's setup log is missing it is
+    # stuck in XLA/accelerate init BEFORE this point.
+    import sys, time
+    _slog_path = output_dir / f"rank_{accelerator.process_index}_setup.log"
+    _slog_fh = open(_slog_path, "w", buffering=1)
+    def _slog(msg: str):
+        ts = time.strftime("%H:%M:%S")
+        _slog_fh.write(f"[{ts}][R{accelerator.process_index}] {msg}\n")
+        _slog_fh.flush()
+    _slog(f"=== Setup start | device={device} | pid={os.getpid()} ===")
+
     # Only initialize the Hub manager on the main process to avoid concurrent HF API requests
     hub_manager = None
     if accelerator.is_main_process:
+        _slog("Initialising hub_manager...")
         hub_manager = init_forge_hub(args.forge_config)
+        _slog("hub_manager ready.")
 
     # ── Resume from checkpoint ────────────────────────────────────────────────
     start_step = 0
-    import sys, time
+    _slog("Starting auto-resume check...")
+
 
     if args.auto_resume and args.resume is None:
         # Step 1: Main process pulls the latest checkpoint from Hub if not locally available
@@ -638,6 +655,7 @@ def train():
         if latest_local is not None:
             args.resume = str(latest_local)
             print(f"[Rhapsody] Found checkpoint to resume: {latest_local}")
+    _slog(f"Resume check done. args.resume={args.resume}")
 
     if args.resume:
         ckpt_path = Path(args.resume)
@@ -729,6 +747,7 @@ def train():
 
     # ── Dataset per stage ────────────────────────────────────────────────────
     global_batch_size = args.batch_size * args.grad_accum * accelerator.num_processes
+    _slog(f"Creating dataset: stage={args.stage}")
     if args.stage == "pretrain":
         dataset = TextPretrainDataset(
             tokenizer,
@@ -746,6 +765,7 @@ def train():
         )
     else:
         dataset = AudioTextDataset(tokenizer, seq_len=args.seq_len)
+    _slog(f"Dataset created: {type(dataset).__name__}")
 
     # ── DataLoader ────────────────────────────────────────────────────────────
     # IterableDatasets are not safe to shard across workers without a worker_init_fn.
@@ -780,6 +800,7 @@ def train():
         collate_fn=collate_fn,
         persistent_workers=(num_workers > 0),
     )
+    _slog("DataLoader created. Starting accelerator.prepare()...")
 
     # ── Prepare Accelerator ──────────────────────────────────────────────────
     if isinstance(dataset, IterableDataset):
@@ -791,6 +812,7 @@ def train():
         model, optimizer, dataloader, scheduler = accelerator.prepare(
             model, optimizer, dataloader, scheduler
         )
+    _slog("accelerator.prepare() complete.")
 
     # Note: torch.compile is intentionally called after accelerator.prepare.
     # The optimizer holds references to the original model parameters, and DDP wrappers
@@ -801,6 +823,40 @@ def train():
         torch._dynamo.config.cache_size_limit = 64
         model = torch.compile(model)
 
+    # ── All-ranks-ready barrier ───────────────────────────────────────────────
+    # CRITICAL: Without this barrier, rank 0 enters the training loop and burns
+    # CPU on Python tokenisation + XLA dispatch, starving ranks 1-7 from finishing
+    # their dataset creation. All ranks signal readiness; none proceed until every
+    # rank has written its ready file. File-based: avoids XLA collective deadlocks.
+    if device.type == "xla" and accelerator.num_processes > 1:
+        _rdy = output_dir / f".rank_{accelerator.process_index}_ready"
+        _rdy.touch()
+        _slog(f"Ready-file written. Waiting for all {accelerator.num_processes} ranks...")
+        print(f"[Rhapsody] Rank {accelerator.process_index}: at all-ranks barrier "
+              f"(waiting for all {accelerator.num_processes} ranks)...")
+        _bd = time.time() + 600  # 10-minute timeout
+        while time.time() < _bd:
+            n_rdy = sum(
+                1 for i in range(accelerator.num_processes)
+                if (output_dir / f".rank_{i}_ready").exists()
+            )
+            if n_rdy >= accelerator.num_processes:
+                break
+            time.sleep(0.5)
+        else:
+            n_rdy = sum(
+                1 for i in range(accelerator.num_processes)
+                if (output_dir / f".rank_{i}_ready").exists()
+            )
+            _slog(f"WARNING: barrier timed out! Only {n_rdy}/{accelerator.num_processes} ranks ready.")
+            print(f"[Rhapsody] WARNING: barrier timed out! Only {n_rdy}/{accelerator.num_processes} ranks ready.")
+        # Brief pause so all ranks see all files, then clean up this rank's file
+        time.sleep(2)
+        _rdy.unlink(missing_ok=True)
+        _slog("All-ranks barrier passed. Entering training loop.")
+        if accelerator.is_main_process:
+            print("[Rhapsody] All-ranks-ready barrier passed. Starting training loop.")
+
     # ── Training ─────────────────────────────────────────────────────────────
     total_steps = args.max_steps
     eff_batch = args.batch_size * args.grad_accum * accelerator.num_processes
@@ -808,6 +864,7 @@ def train():
           f"batch={args.batch_size}, accum={args.grad_accum}, eff_batch={eff_batch}")
 
     model.train()
+
     step = start_step  # tracks optimizer steps
     running_loss = 0.0
     running_grad_norm = 0.0
