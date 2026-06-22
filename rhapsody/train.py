@@ -577,66 +577,62 @@ def train():
 
     # ── Resume from checkpoint ────────────────────────────────────────────────
     start_step = 0
-    import sys
-    sys.stdout.write(f"[Rank {accelerator.process_index}] Starting resume check...\n")
-    sys.stdout.flush()
+    import sys, time
 
     if args.auto_resume and args.resume is None:
-        sys.stdout.write(f"[Rank {accelerator.process_index}] Scanning for local checkpoints...\n")
-        sys.stdout.flush()
-        
         # Step 1: Main process pulls the latest checkpoint from Hub if not locally available
         if accelerator.is_main_process and hub_manager is not None:
             latest_local = find_latest_checkpoint(output_dir)
-            sys.stdout.write(f"[Rank {accelerator.process_index}] Latest local checkpoint scan: {latest_local}\n")
-            sys.stdout.flush()
             if latest_local is None:
-                sys.stdout.write(f"[Rank {accelerator.process_index}] No local checkpoints. Pulling from Hub...\n")
-                sys.stdout.flush()
+                print("[Rhapsody] No local checkpoints found. Pulling from Hub...")
                 pulled = hub_manager.pull_latest(output_dir)
-                sys.stdout.write(f"[Rank {accelerator.process_index}] Hub pull result: {pulled}\n")
-                sys.stdout.flush()
                 if pulled is not None:
                     print(f"[Rhapsody] Pulled latest checkpoint from Hub: {pulled}")
 
-        sys.stdout.write(f"[Rank {accelerator.process_index}] Waiting at wait_for_everyone...\n")
-        sys.stdout.flush()
-        
-        # Step 2: Unconditionally wait for everyone so all subprocesses sync after download completes
-        accelerator.wait_for_everyone()
-        
-        sys.stdout.write(f"[Rank {accelerator.process_index}] Passed wait_for_everyone.\n")
-        sys.stdout.flush()
+        # Step 2: Synchronize all processes so non-main ranks wait for any Hub download.
+        # CRITICAL: accelerator.wait_for_everyone() calls xm.rendezvous() which is a lazy
+        # XLA collective op. Before accelerator.prepare() is called, the XLA distributed
+        # runtime is not ready to execute collectives, causing a permanent deadlock on
+        # multi-core TPU (v5e-8). We use a file-based sentinel instead, which requires
+        # no XLA collective communication.
+        if device.type == "xla" and accelerator.num_processes > 1:
+            _sentinel = output_dir / ".rank0_resume_ready"
+            if accelerator.is_main_process:
+                _sentinel.touch()
+            else:
+                _t0 = time.time()
+                while not _sentinel.exists():
+                    if time.time() - _t0 > 300:
+                        break
+                    time.sleep(0.5)
+            # Brief pause so all non-main ranks see the file before rank 0 removes it
+            time.sleep(2)
+            if accelerator.is_main_process:
+                _sentinel.unlink(missing_ok=True)
+        else:
+            # GPU / CPU / single-process: standard barrier is safe here
+            accelerator.wait_for_everyone()
 
-        # Step 3: All processes scan the local directory and find the downloaded/existing checkpoint
+        # Step 3: All processes independently scan for the checkpoint
         latest_local = find_latest_checkpoint(output_dir)
-        sys.stdout.write(f"[Rank {accelerator.process_index}] Final local checkpoint scan: {latest_local}\n")
-        sys.stdout.flush()
         if latest_local is not None:
             args.resume = str(latest_local)
+            print(f"[Rhapsody] Found checkpoint to resume: {latest_local}")
 
     if args.resume:
-        sys.stdout.write(f"[Rank {accelerator.process_index}] Entering resume from {args.resume}...\n")
-        sys.stdout.flush()
         ckpt_path = Path(args.resume)
         model_pt = ckpt_path / "model.pt"
         opt_pt = ckpt_path / "optimizer.pt"
         sched_pt = ckpt_path / "scheduler.pt"
         if model_pt.exists():
             print(f"[Rhapsody] Resuming from {ckpt_path}")
-            sys.stdout.write(f"[Rank {accelerator.process_index}] Loading model.pt...\n")
-            sys.stdout.flush()
             ckpt = torch.load(model_pt, map_location="cpu", weights_only=True)
-            sys.stdout.write(f"[Rank {accelerator.process_index}] Loaded model.pt onto CPU.\n")
-            sys.stdout.flush()
             # Support both wrapped and unwrapped checkpoints
             state_dict = ckpt["model"]
             if any(k.startswith("module.") for k in state_dict):
                 state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
             model.load_state_dict(state_dict)
             start_step = ckpt.get("step", 0)
-            sys.stdout.write(f"[Rank {accelerator.process_index}] Loaded model state dict. step={start_step}\n")
-            sys.stdout.flush()
             if "rng_state" in ckpt:
                 try:
                     torch.set_rng_state(ckpt["rng_state"].cpu().byte())
@@ -667,11 +663,7 @@ def train():
                     print(f"[Rhapsody] WARNING: Failed to restore XLA RNG state: {e}")
             print(f"[Rhapsody] Resumed at step {start_step}")
         if opt_pt.exists():
-            sys.stdout.write(f"[Rank {accelerator.process_index}] Loading optimizer.pt...\n")
-            sys.stdout.flush()
             opt_ckpt = torch.load(opt_pt, map_location="cpu", weights_only=True)
-            sys.stdout.write(f"[Rank {accelerator.process_index}] Loaded optimizer.pt onto CPU.\n")
-            sys.stdout.flush()
             saved_state_dict = opt_ckpt["optimizer"]
             try:
                 # Collect all parameters from saved groups
@@ -709,12 +701,8 @@ def train():
                 optimizer.load_state_dict(saved_state_dict)
         if sched_pt.exists():
             print(f"[Rhapsody] Loading scheduler state from {sched_pt}")
-            sys.stdout.write(f"[Rank {accelerator.process_index}] Loading scheduler.pt...\n")
-            sys.stdout.flush()
             sched_ckpt = torch.load(sched_pt, map_location="cpu", weights_only=True)
             scheduler.load_state_dict(sched_ckpt["scheduler"])
-            sys.stdout.write(f"[Rank {accelerator.process_index}] Loaded scheduler.pt onto CPU.\n")
-            sys.stdout.flush()
         else:
             # Fallback if scheduler state is missing: set last_epoch manually
             scheduler.last_epoch = start_step
