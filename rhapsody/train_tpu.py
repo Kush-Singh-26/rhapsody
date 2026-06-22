@@ -411,8 +411,16 @@ def train():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # We need to know our rank. If running via accelerate, it sets LOCAL_RANK.
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    # We need to know our rank for early logging.
+    local_rank = 0
+    if "LOCAL_RANK" in os.environ:
+        local_rank = int(os.environ["LOCAL_RANK"])
+    else:
+        try:
+            import torch_xla.core.xla_model as xm
+            local_rank = xm.get_ordinal()
+        except (ImportError, RuntimeError, Exception):
+            pass
     
     _slog_path = output_dir / f"rank_{local_rank}_setup.log"
     _slog_fh = open(_slog_path, "w", buffering=1)
@@ -1077,4 +1085,25 @@ def train():
 
 
 if __name__ == "__main__":
-    train()
+    is_tpu = False
+    try:
+        import torch_xla.core.xla_model as xm
+        is_tpu = True
+    except ImportError:
+        pass
+
+    # On TPU, if not launched via torchrun/accelerate (LOCAL_RANK missing), use xmp.spawn
+    if is_tpu and "LOCAL_RANK" not in os.environ:
+        import torch_xla.distributed.xmp as xmp
+        
+        # Determine number of TPU cores available (defaults to 8 on Kaggle v5e-8)
+        nprocs = int(os.environ.get("TPU_NUM_DEVICES", "8"))
+        
+        print(f"[Rhapsody] Auto-detected TPU without torchrun. Launching {nprocs} processes via xmp.spawn...")
+        
+        def _mp_fn(index):
+            train()
+            
+        xmp.spawn(_mp_fn, args=(), nprocs=nprocs, start_method='fork')
+    else:
+        train()
