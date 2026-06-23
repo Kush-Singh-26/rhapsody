@@ -16,6 +16,10 @@ if "LOCAL_WORLD_SIZE" in os.environ:
 os.environ.pop("TPU_PROCESS_ADDRESSES", None)
 os.environ.pop("CLOUD_TPU_TASK_ID", None)
 
+# Prevent JAX and TensorFlow from claiming the TPU device or conflicting with PyTorch/XLA's metrics reporting
+os.environ["JAX_PLATFORMS"] = "cpu"
+os.environ["TPU_LOAD_LIBRARY"] = "0"
+
 import random
 import sys
 import time
