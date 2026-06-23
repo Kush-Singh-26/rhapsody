@@ -16,11 +16,29 @@ if "LOCAL_WORLD_SIZE" in os.environ:
 os.environ.pop("TPU_PROCESS_ADDRESSES", None)
 os.environ.pop("CLOUD_TPU_TASK_ID", None)
 
-# Block TensorFlow and JAX from being imported to avoid metrics aggregator conflicts on TPU
+# Block TensorFlow and JAX from being imported to avoid metrics aggregator conflicts on TPU.
+# We use a custom meta path finder that returns a valid ModuleSpec but raises ModuleNotFoundError on load.
+# This prevents actual imports (which load libtpu.so) while satisfying tools like torch._dynamo
+# that call importlib.util.find_spec directly (raising ModuleNotFoundError inside find_spec violates python contract).
 import sys
-sys.modules["tensorflow"] = None
-sys.modules["jax"] = None
-sys.modules["jaxlib"] = None
+from importlib.machinery import ModuleSpec
+
+class BlockedImportLoader:
+    def create_module(self, spec):
+        raise ModuleNotFoundError(f"No module named '{spec.name}'")
+    def exec_module(self, module):
+        raise ModuleNotFoundError(f"No module named '{module.__name__}'")
+
+class BlockedImportFinder:
+    def __init__(self, blocked_names):
+        self.blocked_names = blocked_names
+    def find_spec(self, fullname, path, target=None):
+        parts = fullname.split(".")
+        if parts[0] in self.blocked_names:
+            return ModuleSpec(fullname, BlockedImportLoader())
+        return None
+
+sys.meta_path.insert(0, BlockedImportFinder({"tensorflow", "jax", "jaxlib"}))
 
 # CRITICAL: Patch xmp.spawn to force start_method='spawn' (defaults to 'fork' in some environments).
 # This prevents child processes from inheriting initialized XLA/libtpu C++ states from the parent,
@@ -337,7 +355,9 @@ def init_forge_hub(config_path: Optional[str]):
         cfg = ForgeConfig.load(cfg_path)
         return HubManager(cfg.state, cfg.name)
     except Exception as e:
+        import traceback
         print(f"[Rhapsody] WARNING: Forge Hub integration disabled: {e}")
+        traceback.print_exc()
         return None
 
 

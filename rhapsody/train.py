@@ -307,7 +307,9 @@ def init_forge_hub(config_path: Optional[str]):
         cfg = ForgeConfig.load(cfg_path)
         return HubManager(cfg.state, cfg.name)
     except Exception as e:
+        import traceback
         print(f"[Rhapsody] WARNING: Forge Hub integration disabled: {e}")
+        traceback.print_exc()
         return None
 
 
