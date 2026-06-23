@@ -17,28 +17,22 @@ os.environ.pop("TPU_PROCESS_ADDRESSES", None)
 os.environ.pop("CLOUD_TPU_TASK_ID", None)
 
 # Block TensorFlow and JAX from being imported to avoid metrics aggregator conflicts on TPU.
-# We use a custom meta path finder that returns a valid ModuleSpec but raises ModuleNotFoundError on load.
-# This prevents actual imports (which load libtpu.so) while satisfying tools like torch._dynamo
-# that call importlib.util.find_spec directly (raising ModuleNotFoundError inside find_spec violates python contract).
+# 1. We set sys.modules to None to ensure standard imports fail immediately and reliably.
+# 2. We patch importlib.util.find_spec to return None, preventing frameworks (like transformers)
+#    from detecting them as available on Kaggle and throwing subsequent runtime errors when trying to load them.
 import sys
-from importlib.machinery import ModuleSpec
+import importlib.util
 
-class BlockedImportLoader:
-    def create_module(self, spec):
-        raise ModuleNotFoundError(f"No module named '{spec.name}'")
-    def exec_module(self, module):
-        raise ModuleNotFoundError(f"No module named '{module.__name__}'")
-
-class BlockedImportFinder:
-    def __init__(self, blocked_names):
-        self.blocked_names = blocked_names
-    def find_spec(self, fullname, path, target=None):
-        parts = fullname.split(".")
-        if parts[0] in self.blocked_names:
-            return ModuleSpec(fullname, BlockedImportLoader())
+_orig_find_spec = importlib.util.find_spec
+def _custom_find_spec(name, package=None):
+    if name.split('.')[0] in {"tensorflow", "jax", "jaxlib"}:
         return None
+    return _orig_find_spec(name, package)
+importlib.util.find_spec = _custom_find_spec
 
-sys.meta_path.insert(0, BlockedImportFinder({"tensorflow", "jax", "jaxlib"}))
+sys.modules["tensorflow"] = None
+sys.modules["jax"] = None
+sys.modules["jaxlib"] = None
 
 # CRITICAL: Patch xmp.spawn to force start_method='spawn' (defaults to 'fork' in some environments).
 # This prevents child processes from inheriting initialized XLA/libtpu C++ states from the parent,
