@@ -79,11 +79,8 @@ class TextPretrainDataset(IterableDataset):
         self.tokenizer = tokenizer
         self.seq_len = seq_len
 
-        # Calculate approximate documents to skip (assuming ~1000 tokens per document)
+        # Calculate approximate documents to skip based on dataset densities
         total_tokens_to_skip = resume_step * global_batch_size * seq_len
-        # Bypassed: IterableDataset.skip(N) is an O(N) sequential download/discard operation
-        # which takes hours for large resume steps on multi-process systems.
-        docs_to_skip = 0
 
         # Resolve distributed sharding info BEFORE loading datasets.
         # CRITICAL: split_dataset_by_node must be applied to each sub-dataset INDIVIDUALLY
@@ -103,27 +100,74 @@ class TextPretrainDataset(IterableDataset):
             _world = 1
         _do_shard = _world > 1
 
+        def _fast_forward_dataset(ds, tokens_to_skip, density_factor, total_docs, is_dclm=False):
+            if tokens_to_skip <= 0:
+                return ds
+            docs_to_skip = tokens_to_skip // density_factor
+            ex_it = ds._ex_iterable
+            if not hasattr(ex_it, "kwargs"):
+                return ds
+
+            if is_dclm:
+                original_files = ex_it.kwargs.get("original_files", [])
+                if original_files:
+                    files_len = len(original_files)
+                    docs_per_file = total_docs / files_len
+                    files_to_skip = int(docs_to_skip // docs_per_file)
+                    remaining_docs = int(docs_to_skip % docs_per_file)
+                    
+                    files_to_skip = min(files_to_skip, files_len - 1)
+                    if files_to_skip > 0:
+                        ex_it.kwargs["original_files"] = ex_it.kwargs["original_files"][files_to_skip:]
+                        ex_it.kwargs["base_files"] = ex_it.kwargs["base_files"][files_to_skip:]
+                        ex_it.kwargs["files_iterables"] = ex_it.kwargs["files_iterables"][files_to_skip:]
+                        print(f"[Rhapsody] [DCLM] Shard-level fast-forward: skipped {files_to_skip} shards.")
+                    if remaining_docs > 0:
+                        print(f"[Rhapsody] [DCLM] Doc-level fast-forward: skipping remaining {remaining_docs} documents...")
+                        ds = ds.skip(remaining_docs)
+            else:
+                files = ex_it.kwargs.get("files", [])
+                if files:
+                    files_len = len(files)
+                    docs_per_file = total_docs / files_len
+                    files_to_skip = int(docs_to_skip // docs_per_file)
+                    remaining_docs = int(docs_to_skip % docs_per_file)
+                    
+                    files_to_skip = min(files_to_skip, files_len - 1)
+                    if files_to_skip > 0:
+                        ex_it.kwargs["files"] = ex_it.kwargs["files"][files_to_skip:]
+                        if "row_groups_list" in ex_it.kwargs:
+                            ex_it.kwargs["row_groups_list"] = ex_it.kwargs["row_groups_list"][files_to_skip:]
+                        print(f"[Rhapsody] [Parquet] Shard-level fast-forward: skipped {files_to_skip} shards.")
+                    if remaining_docs > 0:
+                        print(f"[Rhapsody] [Parquet] Doc-level fast-forward: skipping remaining {remaining_docs} documents...")
+                        ds = ds.skip(remaining_docs)
+            return ds
+
         datasets_list = []
         weights = []
 
-        print(f"[Rhapsody] Fast-forwarding streaming datasets by ~{docs_to_skip} documents...")
+        print(f"[Rhapsody] Fast-forwarding streaming datasets for step {resume_step} ({total_tokens_to_skip:,} tokens)...")
 
+        # 1. FineWeb-Edu
         fw = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
-        if docs_to_skip > 0: fw = fw.skip(int(docs_to_skip * fineweb_ratio))
+        fw = _fast_forward_dataset(fw, total_tokens_to_skip * fineweb_ratio, 1034, 9672101, is_dclm=False)
         if _do_shard:
             fw = _split_by_node(fw, rank=_rank, world_size=_world)
         datasets_list.append(fw)
         weights.append(fineweb_ratio)
 
+        # 2. DCLM
         dclm = load_dataset("mlfoundations/dclm-baseline-1.0", split="train", streaming=True)
-        if docs_to_skip > 0: dclm = dclm.skip(int(docs_to_skip * dclm_ratio))
+        dclm = _fast_forward_dataset(dclm, total_tokens_to_skip * dclm_ratio, 1333, 3000000000, is_dclm=True)
         if _do_shard:
             dclm = _split_by_node(dclm, rank=_rank, world_size=_world)
         datasets_list.append(dclm)
         weights.append(dclm_ratio)
 
+        # 3. Cosmopedia
         cosmo = load_dataset("HuggingFaceTB/cosmopedia-v2", name="cosmopedia-v2", split="train", streaming=True)
-        if docs_to_skip > 0: cosmo = cosmo.skip(int(docs_to_skip * cosmopedia_ratio))
+        cosmo = _fast_forward_dataset(cosmo, total_tokens_to_skip * cosmopedia_ratio, 803, 39134000, is_dclm=False)
         if _do_shard:
             cosmo = _split_by_node(cosmo, rank=_rank, world_size=_world)
         datasets_list.append(cosmo)
