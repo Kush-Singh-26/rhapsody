@@ -444,7 +444,8 @@ def train():
     _slog("Initializing Accelerator...")
     accelerator = Accelerator(
         mixed_precision=mixed_precision,
-        gradient_accumulation_steps=args.grad_accum
+        gradient_accumulation_steps=args.grad_accum,
+        step_scheduler_with_optimizer=False
     )
     device = accelerator.device
     print = accelerator.print
