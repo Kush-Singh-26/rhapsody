@@ -22,6 +22,18 @@ sys.modules["tensorflow"] = None
 sys.modules["jax"] = None
 sys.modules["jaxlib"] = None
 
+# CRITICAL: Patch xmp.spawn to force start_method='spawn' (defaults to 'fork' in some environments).
+# This prevents child processes from inheriting initialized XLA/libtpu C++ states from the parent,
+# which causes the "Check failed: reporting_closure_ == nullptr" crash under PJRT.
+try:
+    import torch_xla.distributed.xla_multiprocessing as xmp
+    _orig_spawn = xmp.spawn
+    def _custom_spawn(fn, args=(), nprocs=None, start_method='spawn', join=True, daemon=False):
+        return _orig_spawn(fn, args=args, nprocs=nprocs, start_method='spawn', join=join, daemon=daemon)
+    xmp.spawn = _custom_spawn
+except Exception as e:
+    print(f"[Rhapsody] Warning: failed to patch xmp.spawn: {e}")
+
 import random
 import sys
 import time
