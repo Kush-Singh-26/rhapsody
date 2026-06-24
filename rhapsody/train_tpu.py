@@ -84,10 +84,10 @@ from accelerate import Accelerator
 
 try:
     from .model import RhapsodyConfig, create_text_only_65m, create_rhapsody_65m
-    from .data import get_tokenizer, TextPretrainDataset, AudioTextDataset, SymbolicMusicDataset, DataCollatorWithPadding
+    from .data import get_tokenizer, TextPretrainDataset, AudioTextDataset, SymbolicMusicDataset, DataCollatorWithPadding, PreTokenizedDataset
 except ImportError:
     from model import RhapsodyConfig, create_text_only_65m, create_rhapsody_65m
-    from data import get_tokenizer, TextPretrainDataset, AudioTextDataset, SymbolicMusicDataset, DataCollatorWithPadding
+    from data import get_tokenizer, TextPretrainDataset, AudioTextDataset, SymbolicMusicDataset, DataCollatorWithPadding, PreTokenizedDataset
 
 
 # =============================================================================
@@ -677,6 +677,10 @@ def train():
                         help="Max examples to load from symbolic dataset.")
     parser.add_argument("--num-workers", type=int, default=None,
                         help="Number of DataLoader workers. Defaults to CPU count limited.")
+    parser.add_argument("--pretok-dir", type=str, default=None,
+                        help="Path to pre-tokenized shard directory produced by pretokenize.py. "
+                             "When set, bypasses streaming tokenization for ~3x faster throughput "
+                             "on TPU. Only applies to --stage pretrain.")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -1004,7 +1008,14 @@ def train():
     # ── Dataset per stage ────────────────────────────────────────────────────
     global_batch_size = args.batch_size * args.grad_accum * accelerator.num_processes
     _slog(f"Creating dataset: stage={args.stage}")
-    if args.stage == "pretrain":
+    if args.stage == "pretrain" and args.pretok_dir and Path(args.pretok_dir).exists():
+        # ── Fast path: pre-tokenized shards from pretokenize.py ──────────────
+        # Dataset only contains the remaining training data (post-resume-step).
+        # already_fast_forwarded=True suppresses the Subset-skip logic below.
+        print(f"[Rhapsody] Using pre-tokenized dataset from {args.pretok_dir}")
+        dataset = PreTokenizedDataset(args.pretok_dir, seq_len=args.seq_len)
+    elif args.stage == "pretrain":
+        # ── Slow path: live streaming + on-the-fly tokenization ───────────────
         dataset = TextPretrainDataset(
             tokenizer,
             seq_len=args.seq_len,
@@ -1024,19 +1035,32 @@ def train():
     _slog(f"Dataset created: {type(dataset).__name__}")
 
     # ── DataLoader ────────────────────────────────────────────────────────────
-    # IterableDatasets are not safe to shard across workers without a worker_init_fn.
-    # Use num_workers=0 for streaming/iterable datasets to avoid duplicate samples.
     is_iterable = isinstance(dataset, IterableDataset)
-    num_workers = 0 if is_iterable else (args.num_workers if args.num_workers is not None else min(4, os.cpu_count() or 1))
+    is_pretok   = isinstance(dataset, PreTokenizedDataset)
 
-    if not is_iterable:
-        collate_fn = DataCollatorWithPadding(tokenizer)
+    if is_pretok:
+        # Pre-tokenized: map-style, fixed-length, no padding needed.
+        # Use 2 persistent workers per rank to overlap disk I/O with TPU compute.
+        num_workers = args.num_workers if args.num_workers is not None else 2
+        collate_fn  = None
+    elif is_iterable:
+        # Streaming IterableDatasets: must use 0 workers to avoid duplicate samples.
+        num_workers = 0
+        collate_fn  = None
     else:
-        collate_fn = None  # Stage 1 packed dataset doesn't need padding
+        # Other map-style datasets (AudioText, SymbolicMusic): need padding collator.
+        num_workers = args.num_workers if args.num_workers is not None else min(4, os.cpu_count() or 1)
+        collate_fn  = DataCollatorWithPadding(tokenizer)
 
-    # ── Fast-forwarding (Map-Style) ──────────────────────────────────────────
+    # ── Fast-forwarding ───────────────────────────────────────────────────────
     batches_to_skip = start_step * args.grad_accum
-    if not is_iterable and batches_to_skip > 0:
+    if getattr(dataset, 'already_fast_forwarded', False):
+        # PreTokenizedDataset: dataset was generated starting exactly at the resume
+        # point — no subset skipping needed.
+        batches_to_skip = 0
+        print(f"[Rhapsody] Pre-tokenized dataset starts at resume point (step {start_step}). "
+              f"Skipping Subset fast-forward.")
+    elif not is_iterable and batches_to_skip > 0:
         examples_to_skip = batches_to_skip * args.batch_size * accelerator.num_processes
         print(f"[Rhapsody] Fast-forwarding map-style dataset by {examples_to_skip} examples...")
         if examples_to_skip < len(dataset):
@@ -1045,7 +1069,7 @@ def train():
             dataset = torch.utils.data.Subset(dataset, [])
         batches_to_skip = 0  # Handled via Subset
     elif is_iterable:
-        # Iterable datasets are now fast-forwarded O(1) inside TextPretrainDataset initialization
+        # Iterable datasets fast-forward O(1) inside their __init__ (TextPretrainDataset).
         batches_to_skip = 0
 
     dataloader = DataLoader(
@@ -1059,13 +1083,17 @@ def train():
     _slog("DataLoader created. Starting accelerator.prepare()...")
 
     # ── Prepare Accelerator ──────────────────────────────────────────────────
-    if isinstance(dataset, IterableDataset):
-        # Bypass wrapping the dataloader in MpDeviceLoader to avoid asynchronous prefetch deadlocks on TPU.
-        # Do NOT pass the scheduler to accelerator.prepare to prevent wrap-corruption/scaling bugs.
+    if is_iterable and not is_pretok:
+        # Streaming IterableDatasets: bypass MpDeviceLoader wrapping to avoid
+        # asynchronous prefetch deadlocks. Do NOT pass the scheduler to
+        # accelerator.prepare to prevent wrap-corruption/scaling bugs.
         model, optimizer = accelerator.prepare(
             model, optimizer
         )
     else:
+        # Map-style datasets (PreTokenizedDataset, AudioText, SymbolicMusic):
+        # include dataloader so Accelerate adds DistributedSampler + MpDeviceLoader
+        # for correct multi-rank distribution and async H2D prefetch on TPU.
         model, optimizer, dataloader = accelerator.prepare(
             model, optimizer, dataloader
         )
@@ -1133,11 +1161,21 @@ def train():
     # Note: torch.compile is intentionally called after accelerator.prepare.
     # The optimizer holds references to the original model parameters, and DDP wrappers
     # are compiled correctly.
-    if args.compile and device.type == "cuda":
+    # On XLA/TPU: uses the openxla backend (torch_xla >= 2.1). Expect a 2-3 min
+    # warmup while XLA traces and compiles the graph, then throughput improves ~15-20%.
+    if args.compile:
         print("[Rhapsody] Compiling model with torch.compile...")
         os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(output_dir / ".inductor_cache"))
         torch._dynamo.config.cache_size_limit = 64
-        model = torch.compile(model)
+        if device.type == "xla":
+            try:
+                model = torch.compile(model, backend="openxla")
+                print("[Rhapsody] torch.compile: using openxla backend (TPU).")
+            except Exception as e:
+                print(f"[Rhapsody] openxla backend unavailable ({e}). Falling back to default compile.")
+                model = torch.compile(model)
+        else:
+            model = torch.compile(model)
 
     # ── All-ranks-ready barrier ───────────────────────────────────────────────
     # CRITICAL: Without this barrier, rank 0 enters the training loop and burns

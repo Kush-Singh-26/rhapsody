@@ -215,7 +215,118 @@ class TextPretrainDataset(IterableDataset):
                     yield {"input_ids": input_ids, "labels": labels}
 
 
+class PreTokenizedDataset(Dataset):
+    """
+    Map-style dataset backed by pre-tokenized int16 shard files.
+
+    Created by pretokenize.py. Each shard is a flat int16 tensor of
+    SHARD_SIZE tokens (document-packed, EOS-delimited, no padding).
+    __getitem__(i) extracts a (seq_len + 1) window from the right shard
+    and splits it into pre-shifted input_ids / labels.
+
+    Advantages over streaming TextPretrainDataset:
+      • Reads from local disk — zero network I/O during training.
+      • Map-style → compatible with num_workers > 0 and MpDeviceLoader.
+      • already_fast_forwarded = True — tells train_tpu.py this dataset
+        already starts at the correct resume point; no Subset skipping needed.
+
+    RAM usage: 2-shard LRU cache per DataLoader worker.
+    Each shard ≈ 100 MB (int16) → ~200 MB cache per worker at default settings.
+    """
+
+    already_fast_forwarded: bool = True
+
+    def __init__(self, shard_dir: str, seq_len: int = 1024):
+        self.shard_dir = Path(shard_dir)
+        self.seq_len   = seq_len
+        self.chunk_len = seq_len + 1          # tokens per example: input + 1 label overlap
+
+        meta_path = self.shard_dir / "meta.json"
+        if not meta_path.exists():
+            raise FileNotFoundError(
+                f"[Rhapsody] PreTokenizedDataset: meta.json not found in {shard_dir}. "
+                "Run pretokenize.py first."
+            )
+        meta = json.loads(meta_path.read_text())
+
+        self.shard_size            = meta["shard_size_tokens"]
+        self.examples_per_shard    = meta["examples_per_full_shard"]
+        self.last_shard_examples   = meta.get("last_shard_examples", self.examples_per_shard)
+
+        self.shard_paths = sorted(self.shard_dir.glob("shard_*.pt"))
+        if not self.shard_paths:
+            raise FileNotFoundError(
+                f"[Rhapsody] PreTokenizedDataset: no shard_*.pt files found in {shard_dir}"
+            )
+
+        num_full   = len(self.shard_paths) - 1
+        self.total_examples = num_full * self.examples_per_shard + self.last_shard_examples
+
+        print(
+            f"[Rhapsody] PreTokenizedDataset: {len(self.shard_paths)} shards, "
+            f"{self.total_examples:,} examples, "
+            f"~{self.total_examples * seq_len / 1e9:.2f}B tokens"
+        )
+
+        # Per-process shard cache: stores up to 2 shards as int16 (saves RAM).
+        # persistent_workers=True keeps these alive across batches.
+        self._cache: dict[int, torch.Tensor] = {}
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _get_shard(self, shard_idx: int) -> torch.Tensor:
+        """Load shard into int16 cache; evict LRU when cache exceeds 2 entries."""
+        if shard_idx not in self._cache:
+            data = torch.load(
+                self.shard_paths[shard_idx],
+                map_location="cpu",
+                weights_only=True,
+            )  # returns int16 tensor
+            self._cache[shard_idx] = data
+            if len(self._cache) > 2:
+                evict = next(iter(self._cache))
+                del self._cache[evict]
+        return self._cache[shard_idx]
+
+    # ── Dataset interface ─────────────────────────────────────────────────────
+
+    def __len__(self) -> int:
+        return self.total_examples
+
+    def __getitem__(self, idx: int) -> dict:
+        # Locate shard and local position
+        shard_idx  = idx  // self.examples_per_shard
+        local_idx  = idx  %  self.examples_per_shard
+
+        # Safety clamp for the partial last shard
+        shard_idx = min(shard_idx, len(self.shard_paths) - 1)
+
+        start = local_idx * self.chunk_len
+        end   = start + self.chunk_len
+
+        shard = self._get_shard(shard_idx)
+        # Guard against reading past the shard boundary
+        if end > len(shard):
+            end   = len(shard)
+            start = max(0, end - self.chunk_len)
+
+        chunk = shard[start:end].to(torch.long)   # int16 → int64 for embedding lookup
+
+        # Pad with zeros if the very last chunk is shorter than chunk_len (rare edge case)
+        if len(chunk) < self.chunk_len:
+            chunk = torch.cat([
+                chunk,
+                torch.zeros(self.chunk_len - len(chunk), dtype=torch.long),
+            ])
+
+        return {
+            "input_ids": chunk[:-1].clone(),   # [seq_len]  — token t
+            "labels":    chunk[1:].clone(),    # [seq_len]  — token t+1 (pre-shifted)
+        }
+
+
 class AudioTextDataset(Dataset):
+
     """
     Map-style dataset for Stage-2 alignment and Stage-3 fine-tuning.
 
