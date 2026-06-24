@@ -17,22 +17,30 @@ os.environ.pop("TPU_PROCESS_ADDRESSES", None)
 os.environ.pop("CLOUD_TPU_TASK_ID", None)
 
 # Block TensorFlow and JAX from being imported to avoid metrics aggregator conflicts on TPU.
-# 1. We set sys.modules to None to ensure standard imports fail immediately and reliably.
-# 2. We patch importlib.util.find_spec to return None, preventing frameworks (like transformers)
-#    from detecting them as available on Kaggle and throwing subsequent runtime errors when trying to load them.
+# We map them to a dummy MockModule in sys.modules, which prevents actual imports (which load libtpu.so)
+# while satisfying any module-level imports (like transformers.image_transforms) and tools like find_spec
+# that expect a standard module structure.
 import sys
-import importlib.util
+import types
+from importlib.machinery import ModuleSpec
 
-_orig_find_spec = importlib.util.find_spec
-def _custom_find_spec(name, package=None):
-    if name.split('.')[0] in {"tensorflow", "jax", "jaxlib"}:
-        return None
-    return _orig_find_spec(name, package)
-importlib.util.find_spec = _custom_find_spec
+class MockModule(types.ModuleType):
+    def __init__(self, name):
+        super().__init__(name)
+        self.__path__ = []
+        self.__spec__ = ModuleSpec(name, None)
 
-sys.modules["tensorflow"] = None
-sys.modules["jax"] = None
-sys.modules["jaxlib"] = None
+    def __getattr__(self, name):
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        return MockModule(f"{self.__name__}.{name}")
+
+    def __call__(self, *args, **kwargs):
+        return MockModule(f"{self.__name__}.call")
+
+sys.modules["tensorflow"] = MockModule("tensorflow")
+sys.modules["jax"] = MockModule("jax")
+sys.modules["jaxlib"] = MockModule("jaxlib")
 
 # CRITICAL: Patch xmp.spawn to force start_method='spawn' (defaults to 'fork' in some environments).
 # This prevents child processes from inheriting initialized XLA/libtpu C++ states from the parent,
