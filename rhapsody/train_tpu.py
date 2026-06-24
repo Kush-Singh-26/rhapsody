@@ -108,9 +108,11 @@ def get_wsd_lr(step: int, total_steps: int, warmup_frac: float = 0.01, decay_fra
         return step / max(1, warmup_steps)
     elif step < decay_start:
         return 1.0
-    else:
+    elif step < total_steps:
         progress = (step - decay_start) / max(1, total_steps - decay_start)
         return (1 + math.cos(math.pi * progress)) / 2
+    else:
+        return 0.0
 
 
 # =============================================================================
@@ -126,9 +128,11 @@ def get_cosine_lr(step: int, total_steps: int, warmup_frac: float = 0.03) -> flo
     warmup_steps = int(total_steps * warmup_frac)
     if step < warmup_steps:
         return step / max(1, warmup_steps)
-    else:
+    elif step < total_steps:
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         return 0.5 * (1.0 + math.cos(math.pi * progress))
+    else:
+        return 0.0
 
 
 # =============================================================================
@@ -359,6 +363,220 @@ def load_pretrained_text_lm(model: nn.Module, checkpoint_dir: str | Path) -> Non
     print("[Rhapsody] Pretrained LM weights loaded.")
 
 
+class FallbackHubManager:
+    def __init__(self, config_path: str):
+        import yaml
+        import json
+        import tempfile
+        from pathlib import Path
+        with open(config_path, "r") as f:
+            cfg = yaml.safe_load(f)
+        
+        self.project_name = cfg.get("name", "rhapsody-65m")
+        state_cfg = cfg.get("state", {})
+        self.repo_id = state_cfg.get("repo_id", "Kush26/rhapsody-65m-checkpoints")
+        self.branch = state_cfg.get("branch", "checkpoints")
+        self.checkpoint_limit = state_cfg.get("checkpoint_limit", 3)
+        self.private = state_cfg.get("private", True)
+        
+        # Token
+        self.token = os.environ.get("HF_TOKEN")
+        if not self.token:
+            try:
+                from dotenv import load_dotenv
+                cfg_path = Path(config_path)
+                load_dotenv(dotenv_path=cfg_path.parent / ".env")
+                self.token = os.environ.get("HF_TOKEN")
+            except Exception:
+                pass
+        
+        if not self.token:
+            print("[Rhapsody.FallbackHub] WARNING: HF_TOKEN env var not set.")
+            
+        from huggingface_hub import HfApi
+        self.api = HfApi(token=self.token)
+        self.remote_prefix = f"checkpoints/{self.project_name}"
+        
+        # Ensure branch exists
+        try:
+            self.api.create_branch(repo_id=self.repo_id, branch=self.branch, exist_ok=True)
+        except Exception as e:
+            print(f"[Rhapsody.FallbackHub] WARNING: Branch creation failed: {e}")
+
+    def upload_checkpoint(self, local_dir: str | Path, step: int, retries: int = 3) -> None:
+        import time
+        import json
+        import tempfile
+        local_dir = Path(local_dir)
+        path_in_repo = f"{self.remote_prefix}/checkpoint-{step}"
+        for attempt in range(retries):
+            try:
+                print(f"[Rhapsody.FallbackHub] Uploading checkpoint-{step} to '{self.repo_id}' [{self.branch}] (Attempt {attempt+1}/{retries})...")
+                self.api.upload_folder(
+                    repo_id=self.repo_id,
+                    folder_path=str(local_dir),
+                    path_in_repo=path_in_repo,
+                    commit_message=f"Upload checkpoint-{step}",
+                    allow_patterns=["*"],
+                    revision=self.branch,
+                )
+                self._update_latest_pointer(step)
+                print(f"[Rhapsody.FallbackHub] Upload complete & verified: {path_in_repo}")
+                return
+            except Exception as e:
+                print(f"[Rhapsody.FallbackHub] ERROR: Upload attempt {attempt+1} failed: {e}")
+                if attempt < retries - 1:
+                    time.sleep(5 * (attempt + 1))
+
+    def _update_latest_pointer(self, step: int):
+        import json
+        import tempfile
+        pointer_path = f"{self.remote_prefix}/latest.json"
+        data = {"latest_step": step, "timestamp": time.time()}
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
+            json.dump(data, tmp)
+            tmp_path = tmp.name
+        try:
+            self.api.upload_file(
+                path_or_fileobj=tmp_path,
+                path_in_repo=pointer_path,
+                repo_id=self.repo_id,
+                revision=self.branch,
+                commit_message=f"Update latest pointer to step {step}"
+            )
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    def get_latest_verified_step(self) -> Optional[int]:
+        import json
+        pointer_path = f"{self.remote_prefix}/latest.json"
+        try:
+            from huggingface_hub import hf_hub_download
+            local_path = hf_hub_download(
+                repo_id=self.repo_id,
+                filename=pointer_path,
+                revision=self.branch,
+                token=self.token
+            )
+            with open(local_path, "r") as f:
+                return json.load(f).get("latest_step")
+        except Exception:
+            return None
+
+    def prune_checkpoints(self) -> None:
+        steps = self.list_remote_checkpoints()
+        if len(steps) <= self.checkpoint_limit:
+            return
+        to_delete = steps[:-self.checkpoint_limit]
+        for step in to_delete:
+            path_in_repo = f"{self.remote_prefix}/checkpoint-{step}"
+            try:
+                self.api.delete_folder(
+                    repo_id=self.repo_id,
+                    path_in_repo=path_in_repo,
+                    commit_message=f"Prune old checkpoint-{step}",
+                    revision=self.branch,
+                )
+                print(f"[Rhapsody.FallbackHub] Pruned: {path_in_repo}")
+            except Exception as e:
+                print(f"[Rhapsody.FallbackHub] ERROR: Deletion failed for {path_in_repo}: {e}")
+
+    def list_remote_checkpoints(self) -> list[int]:
+        try:
+            repo_tree = self.api.list_repo_tree(
+                repo_id=self.repo_id,
+                path_in_repo=self.remote_prefix,
+                recursive=False,
+                revision=self.branch,
+            )
+            steps = []
+            for item in repo_tree:
+                path_str = str(item.path)
+                if "checkpoint-" in path_str:
+                    folder_name = Path(path_str).name
+                    step_str = folder_name.split("checkpoint-")[-1]
+                    if step_str.isdigit():
+                        steps.append(int(step_str))
+            return sorted(steps)
+        except Exception:
+            return []
+
+    def get_local_checkpoints(self, local_root: str | Path) -> list[int]:
+        local_root = Path(local_root)
+        if not local_root.exists():
+            return []
+        steps = []
+        for item in local_root.iterdir():
+            if item.is_dir() and "checkpoint-" in item.name:
+                step_str = item.name.split("checkpoint-")[-1]
+                if step_str.isdigit():
+                    steps.append(int(step_str))
+        return sorted(steps)
+
+    def pull_latest(self, local_root: str | Path, force: bool = False) -> Optional[Path]:
+        from huggingface_hub import snapshot_download
+        import shutil
+        local_root = Path(local_root)
+        latest_verified = self.get_latest_verified_step()
+        remote_steps = self.list_remote_checkpoints()
+        if not remote_steps:
+            print("[Rhapsody.FallbackHub] No remote checkpoints found.")
+            return None
+        latest_remote = latest_verified if latest_verified is not None else remote_steps[-1]
+        local_steps = self.get_local_checkpoints(local_root)
+        latest_local = local_steps[-1] if local_steps else -1
+        if latest_remote <= latest_local and not force:
+            print(f"[Rhapsody.FallbackHub] Local state (step {latest_local}) is up-to-date with Hub (step {latest_remote}).")
+            return local_root / f"checkpoint-{latest_local}"
+        if force and local_root.exists():
+            print(f"[Rhapsody.FallbackHub] Force pull requested. Clearing {local_root}...")
+            shutil.rmtree(local_root)
+            local_root.mkdir(parents=True, exist_ok=True)
+        
+        target_steps = [latest_remote] if latest_remote in remote_steps else reversed(remote_steps)
+        for latest_step in target_steps:
+            path_in_repo = f"{self.remote_prefix}/checkpoint-{latest_step}"
+            target_path = local_root.resolve() / f"checkpoint-{latest_step}"
+            print(f"[Rhapsody.FallbackHub] Pulling checkpoint-{latest_step}...")
+            try:
+                snapshot_download(
+                    repo_id=self.repo_id,
+                    allow_patterns=[f"{path_in_repo}/*"],
+                    local_dir=str(local_root),
+                    token=self.token,
+                    revision=self.branch,
+                    local_dir_use_symlinks=False
+                )
+                downloaded_path = local_root / path_in_repo
+                if downloaded_path.exists():
+                    if target_path.exists() and target_path != downloaded_path:
+                        shutil.rmtree(target_path)
+                    if target_path != downloaded_path:
+                        target_path.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(downloaded_path), str(target_path))
+                        current = downloaded_path.parent
+                        while current != local_root:
+                            try:
+                                current.rmdir()
+                                current = current.parent
+                            except OSError:
+                                break
+                # check model file exists
+                has_model = (
+                    (target_path / "model.safetensors").exists()
+                    or (target_path / "pytorch_model.bin").exists()
+                    or (target_path / "model.bin").exists()
+                    or (target_path / "model.pt").exists()
+                )
+                if has_model:
+                    print(f"[Rhapsody.FallbackHub] Pull complete: {target_path}")
+                    return target_path
+            except Exception as e:
+                print(f"[Rhapsody.FallbackHub] ERROR: Pull failed: {e}")
+        return None
+
+
 def init_forge_hub(config_path: Optional[str]):
     if not config_path:
         return None
@@ -372,10 +590,14 @@ def init_forge_hub(config_path: Optional[str]):
         cfg = ForgeConfig.load(cfg_path)
         return HubManager(cfg.state, cfg.name)
     except Exception as e:
-        import traceback
-        print(f"[Rhapsody] WARNING: Forge Hub integration disabled: {e}")
-        traceback.print_exc()
-        return None
+        print(f"[Rhapsody] Forge package not found or failed to load. Falling back to self-contained FallbackHubManager: {e}")
+        try:
+            return FallbackHubManager(config_path)
+        except Exception as ex:
+            import traceback
+            print(f"[Rhapsody] ERROR: FallbackHubManager also failed: {ex}")
+            traceback.print_exc()
+            return None
 
 
 def save_checkpoint(
@@ -776,50 +998,8 @@ def train():
                 except Exception as e:
                     print(f"[Rhapsody] WARNING: Failed to restore XLA RNG state: {e}")
             print(f"[Rhapsody] Resumed at step {start_step}")
-        if opt_pt.exists():
-            opt_ckpt = torch.load(opt_pt, map_location="cpu", weights_only=True)
-            saved_state_dict = opt_ckpt["optimizer"]
-            try:
-                # Collect all parameters from saved groups
-                saved_param_ids = []
-                for group in saved_state_dict["param_groups"]:
-                    saved_param_ids.extend(group["params"])
-                
-                # Collect all parameters from active optimizer
-                active_params = []
-                for group in optimizer.param_groups:
-                    active_params.extend(group["params"])
-                
-                if len(saved_param_ids) == len(active_params):
-                    print("[Rhapsody] Aligning optimizer state dict parameter groups...")
-                    new_state = {}
-                    for active_p, saved_pid in zip(active_params, saved_param_ids):
-                        if saved_pid in saved_state_dict["state"]:
-                            new_state[active_p] = {
-                                k: (v.to(active_p.device) if torch.is_tensor(v) else v)
-                                for k, v in saved_state_dict["state"][saved_pid].items()
-                            }
-                    optimizer.state.clear()
-                    optimizer.state.update(new_state)
-                    
-                    # Restore Muon step counter if present
-                    if "_adam_step" in saved_state_dict:
-                        optimizer._adam_step = saved_state_dict["_adam_step"]
-                    
-                    print("[Rhapsody] Optimizer state aligned and loaded successfully.")
-                else:
-                    print(f"[Rhapsody] WARNING: Optimizer parameter count mismatch: saved has {len(saved_param_ids)}, active has {len(active_params)}. Fallback to standard load.")
-                    optimizer.load_state_dict(saved_state_dict)
-            except Exception as e:
-                print(f"[Rhapsody] WARNING: Failed to dynamically align optimizer state dict: {e}. Falling back to standard loading.")
-                optimizer.load_state_dict(saved_state_dict)
-        if sched_pt.exists():
-            print(f"[Rhapsody] Loading scheduler state from {sched_pt}")
-            sched_ckpt = torch.load(sched_pt, map_location="cpu", weights_only=True)
-            scheduler.load_state_dict(sched_ckpt["scheduler"])
-        else:
-            # Fallback if scheduler state is missing: set last_epoch manually
-            scheduler.last_epoch = start_step
+        # Note: optimizer and scheduler states are loaded AFTER accelerator.prepare() to prevent state corruption.
+        pass
 
     # ── Dataset per stage ────────────────────────────────────────────────────
     global_batch_size = args.batch_size * args.grad_accum * accelerator.num_processes
@@ -880,15 +1060,75 @@ def train():
 
     # ── Prepare Accelerator ──────────────────────────────────────────────────
     if isinstance(dataset, IterableDataset):
-        # Bypass wrapping the dataloader in MpDeviceLoader to avoid asynchronous prefetch deadlocks on TPU
-        model, optimizer, scheduler = accelerator.prepare(
-            model, optimizer, scheduler
+        # Bypass wrapping the dataloader in MpDeviceLoader to avoid asynchronous prefetch deadlocks on TPU.
+        # Do NOT pass the scheduler to accelerator.prepare to prevent wrap-corruption/scaling bugs.
+        model, optimizer = accelerator.prepare(
+            model, optimizer
         )
     else:
-        model, optimizer, dataloader, scheduler = accelerator.prepare(
-            model, optimizer, dataloader, scheduler
+        model, optimizer, dataloader = accelerator.prepare(
+            model, optimizer, dataloader
         )
     _slog("accelerator.prepare() complete.")
+
+    # ── Load Optimizer & Scheduler state dicts after prepare ─────────────────
+    if args.resume:
+        opt_pt = Path(args.resume) / "optimizer.pt"
+        sched_pt = Path(args.resume) / "scheduler.pt"
+        if opt_pt.exists():
+            print(f"[Rhapsody] Loading optimizer state from {opt_pt} (after accelerator.prepare)...")
+            opt_ckpt = torch.load(opt_pt, map_location="cpu", weights_only=True)
+            saved_state_dict = opt_ckpt["optimizer"]
+            try:
+                # Collect all parameters from saved groups
+                saved_param_ids = []
+                for group in saved_state_dict["param_groups"]:
+                    saved_param_ids.extend(group["params"])
+                
+                # Collect all parameters from active optimizer
+                active_params = []
+                for group in optimizer.param_groups:
+                    active_params.extend(group["params"])
+                
+                if len(saved_param_ids) == len(active_params):
+                    print("[Rhapsody] Aligning optimizer state dict parameter groups...")
+                    new_state = {}
+                    for active_p, saved_pid in zip(active_params, saved_param_ids):
+                        if saved_pid in saved_state_dict["state"]:
+                            new_state[active_p] = {
+                                k: (v.to(active_p.device) if torch.is_tensor(v) else v)
+                                for k, v in saved_state_dict["state"][saved_pid].items()
+                            }
+                    optimizer.state.clear()
+                    optimizer.state.update(new_state)
+                    
+                    # Restore Muon step counter if present
+                    if "_adam_step" in saved_state_dict:
+                        optimizer._adam_step = saved_state_dict["_adam_step"]
+                    
+                    print("[Rhapsody] Optimizer state aligned and loaded successfully.")
+                else:
+                    print(f"[Rhapsody] WARNING: Optimizer parameter count mismatch: saved has {len(saved_param_ids)}, active has {len(active_params)}. Fallback to standard load.")
+                    optimizer.load_state_dict(saved_state_dict)
+            except Exception as e:
+                print(f"[Rhapsody] WARNING: Failed to dynamically align optimizer state dict: {e}. Falling back to standard loading.")
+                optimizer.load_state_dict(saved_state_dict)
+        
+        if sched_pt.exists():
+            print(f"[Rhapsody] Loading scheduler state from {sched_pt}...")
+            sched_ckpt = torch.load(sched_pt, map_location="cpu", weights_only=True)
+            scheduler.load_state_dict(sched_ckpt["scheduler"])
+            # Force alignment with correct start_step to repair any previously corrupted or scaled last_epoch
+            scheduler.last_epoch = start_step
+            if hasattr(scheduler, "_step_count"):
+                scheduler._step_count = start_step + 1
+            print(f"[Rhapsody] Scheduler last_epoch aligned to {start_step}.")
+        else:
+            # Fallback if scheduler state is missing: set last_epoch manually
+            scheduler.last_epoch = start_step
+            if hasattr(scheduler, "_step_count"):
+                scheduler._step_count = start_step + 1
+            print(f"[Rhapsody] Scheduler last_epoch initialized to fallback: {start_step}.")
 
     # Note: torch.compile is intentionally called after accelerator.prepare.
     # The optimizer holds references to the original model parameters, and DDP wrappers
