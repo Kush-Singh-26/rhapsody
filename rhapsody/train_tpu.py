@@ -1040,8 +1040,11 @@ def train():
 
     if is_pretok:
         # Pre-tokenized: map-style, fixed-length, no padding needed.
-        # Use 2 persistent workers per rank to overlap disk I/O with TPU compute.
-        num_workers = args.num_workers if args.num_workers is not None else 2
+        # IMPORTANT: Use num_workers=0 on Kaggle TPU. Setting num_workers>0 causes
+        # DataLoader to fork child processes. When 8 ranks each fork 2 workers,
+        # you get 16 extra processes all trying to load .pt shards simultaneously,
+        # exhausting RAM and crashing the browser tab.
+        num_workers = 0
         collate_fn  = None
     elif is_iterable:
         # Streaming IterableDatasets: must use 0 workers to avoid duplicate samples.
@@ -1072,31 +1075,44 @@ def train():
         # Iterable datasets fast-forward O(1) inside their __init__ (TextPretrainDataset).
         batches_to_skip = 0
 
+    # For PreTokenizedDataset (map-style), we manually add a DistributedSampler
+    # so each of the 8 ranks gets a non-overlapping slice of the data.
+    # We do NOT pass the dataloader into accelerator.prepare() because on XLA/TPU
+    # that triggers MpDeviceLoader which forks child processes — with 8 ranks and
+    # num_workers>0 this creates a process explosion that crashes the notebook.
+    sampler = None
+    if is_pretok and accelerator.num_processes > 1:
+        from torch.utils.data.distributed import DistributedSampler
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=accelerator.num_processes,
+            rank=accelerator.process_index,
+            shuffle=True,
+            seed=args.seed,
+            drop_last=True,
+        )
+        print(f"[Rhapsody] Rank {accelerator.process_index}: DistributedSampler created "
+              f"({len(sampler):,} examples / {accelerator.num_processes} ranks)")
+
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         num_workers=num_workers,
         pin_memory=(device.type == "cuda"),
         collate_fn=collate_fn,
-        persistent_workers=(num_workers > 0),
+        persistent_workers=False,
+        drop_last=True,   # critical: ensures static batch shapes for XLA compilation
+        sampler=sampler,  # None for iterable/single-process, DistributedSampler for pretok multi-rank
+        shuffle=(sampler is None and not is_iterable and not is_pretok),  # only if no sampler
     )
     _slog("DataLoader created. Starting accelerator.prepare()...")
 
     # ── Prepare Accelerator ──────────────────────────────────────────────────
-    if is_iterable and not is_pretok:
-        # Streaming IterableDatasets: bypass MpDeviceLoader wrapping to avoid
-        # asynchronous prefetch deadlocks. Do NOT pass the scheduler to
-        # accelerator.prepare to prevent wrap-corruption/scaling bugs.
-        model, optimizer = accelerator.prepare(
-            model, optimizer
-        )
-    else:
-        # Map-style datasets (PreTokenizedDataset, AudioText, SymbolicMusic):
-        # include dataloader so Accelerate adds DistributedSampler + MpDeviceLoader
-        # for correct multi-rank distribution and async H2D prefetch on TPU.
-        model, optimizer, dataloader = accelerator.prepare(
-            model, optimizer, dataloader
-        )
+    # IMPORTANT: We NEVER pass the dataloader into accelerator.prepare() on XLA/TPU.
+    # Doing so wraps it in MpDeviceLoader which spawns prefetch worker processes —
+    # on a node with 8 TPU processes, this creates 16+ extra processes and causes
+    # an OOM/crash. Instead we use a manual DistributedSampler (above) for sharding.
+    model, optimizer = accelerator.prepare(model, optimizer)
     _slog("accelerator.prepare() complete.")
 
     # ── Load Optimizer & Scheduler state dicts after prepare ─────────────────
