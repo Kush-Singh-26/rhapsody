@@ -281,7 +281,8 @@ class PreTokenizedDataset(Dataset):
                 self.shard_paths[shard_idx],
                 map_location="cpu",
                 weights_only=True,
-            )  # returns int16 tensor
+                mmap=True,
+            )  # returns int16/int32 tensor mapped lazily
             self._cache[shard_idx] = data
             if len(self._cache) > 2:
                 evict = next(iter(self._cache))

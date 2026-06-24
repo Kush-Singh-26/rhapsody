@@ -16,6 +16,11 @@ if "LOCAL_WORLD_SIZE" in os.environ:
 os.environ.pop("TPU_PROCESS_ADDRESSES", None)
 os.environ.pop("CLOUD_TPU_TASK_ID", None)
 
+# Prevent OpenMP and Eigen thread over-subscription across 8 rank processes
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
 # Block TensorFlow and JAX from being imported to avoid metrics aggregator conflicts on TPU.
 # We map them to a dummy MockModule in sys.modules and register a MockImportFinder in sys.meta_path.
 # This prevents actual imports (which load libtpu.so) while satisfying any module-level imports
@@ -1236,8 +1241,8 @@ def train():
     model.train()
 
     step = start_step  # tracks optimizer steps
-    running_loss = 0.0
-    running_grad_norm = 0.0
+    running_loss = torch.tensor(0.0, device=device)
+    running_grad_norm = torch.tensor(0.0, device=device)
     tokens_in_window = 0
     micro_steps_in_window = 0
     window_start = time.time()
@@ -1314,10 +1319,9 @@ def train():
                         xm.mark_step()     # fallback for older torch_xla
                     _rlog(f"step={step} | torch_xla.sync() DONE ({time.time()-_t3:.3f}s) ✓")
 
-                # NOW retrieve scalar values to the CPU safely after sync
-                loss_val = loss_val_tensor.item()
-                _rlog(f"step={step} | loss={loss_val:.4f} | step COMPLETE")
-                running_loss += loss_val
+                # NOW accumulate values on device without calling .item() at every step
+                _rlog(f"step={step} | step COMPLETE")
+                running_loss += loss_val_tensor
                 micro_steps_in_window += 1
 
                 # Count actual text + audio tokens processed in the batch
@@ -1325,18 +1329,15 @@ def train():
                 batch_audio_tokens = (64 * batch["input_ids"].shape[0]) if "audio_features" in batch else 0
                 tokens_in_window += (batch_text_tokens + batch_audio_tokens)
 
-                grad_norm_val = 0.0
-                if grad_norm_tensor is not None:
-                    grad_norm_val = grad_norm_tensor.item()
-
                 if accelerator.sync_gradients and not accelerator.optimizer_step_was_skipped:
-                    running_grad_norm += grad_norm_val
+                    if grad_norm_tensor is not None:
+                        running_grad_norm += grad_norm_tensor
 
                 # ── Logging ──────────────────────────────────────────────────────
                 if step > 0 and step % args.log_steps == 0 and accelerator.sync_gradients and not accelerator.optimizer_step_was_skipped:
                     elapsed = time.time() - window_start
-                    avg_loss = running_loss / max(1, micro_steps_in_window)
-                    avg_grad_norm = running_grad_norm / args.log_steps
+                    avg_loss = (running_loss / max(1, micro_steps_in_window)).item()
+                    avg_grad_norm = (running_grad_norm / args.log_steps).item()
                     
                     # Gather and sum tokens processed across all processes for logging accurate speed
                     tokens_tensor = torch.tensor(tokens_in_window, device=device)
@@ -1359,8 +1360,8 @@ def train():
                         wandb.log({"loss": avg_loss, "grad_norm": avg_grad_norm, "lr_muon": muon_lr, "lr_adamw": adamw_lr_val,
                                    "tok_per_sec": tok_per_sec, "step": step})
                                    
-                    running_loss = 0.0
-                    running_grad_norm = 0.0
+                    running_loss.fill_(0.0)
+                    running_grad_norm.fill_(0.0)
                     tokens_in_window = 0
                     micro_steps_in_window = 0
                     window_start = time.time()
