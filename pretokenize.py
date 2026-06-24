@@ -86,7 +86,6 @@ print(f"Out dir : {OUT_DIR}")
 print("─" * 60)
 
 buffer:      list[int] = []
-batch_texts: list[str] = []
 shard_idx    = 0
 total_toks   = 0
 t0           = time.time()
@@ -118,34 +117,13 @@ def flush_buffer() -> None:
 
 
 # Main tokenization loop
-for example in mixed:
-    text = example.get("text", "")
-    if not text or len(text) < 100:
+for batch in mixed.batch(batch_size=BATCH_DOCS):
+    texts = batch.get("text", [])
+    batch_texts = [text for text in texts if text and len(text) >= 100]
+    if not batch_texts:
         continue
 
-    batch_texts.append(text)
-
-    if len(batch_texts) >= BATCH_DOCS:
-        # Batch tokenize: the Rust-based fast tokenizer handles this in parallel internally
-        enc = tok(
-            batch_texts,
-            truncation=False,
-            padding=False,
-            return_attention_mask=False,
-            return_tensors=None,
-        )
-        for ids in enc["input_ids"]:
-            buffer.extend(ids)
-            buffer.append(EOS)   # document boundary signal
-        batch_texts = []
-        flush_buffer()
-
-    if total_toks >= TARGET_TOKENS:
-        print(f"\n✅ Reached target of {TARGET_TOKENS / 1e9:.2f}B tokens.")
-        break
-
-# Process any remaining docs in the batch
-if batch_texts:
+    # Batch tokenize: the Rust-based fast tokenizer handles this in parallel internally
     enc = tok(
         batch_texts,
         truncation=False,
@@ -155,8 +133,12 @@ if batch_texts:
     )
     for ids in enc["input_ids"]:
         buffer.extend(ids)
-        buffer.append(EOS)
+        buffer.append(EOS)   # document boundary signal
     flush_buffer()
+
+    if total_toks >= TARGET_TOKENS:
+        print(f"\n✅ Reached target of {TARGET_TOKENS / 1e9:.2f}B tokens.")
+        break
 
 # Save the partial final shard (will be smaller than SHARD_SIZE)
 if len(buffer) >= (SEQ_LEN + 1):
