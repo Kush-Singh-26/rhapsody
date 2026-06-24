@@ -1107,11 +1107,35 @@ def train():
     )
     _slog("DataLoader created. Starting accelerator.prepare()...")
 
+    # ── Wrap DataLoader in MpDeviceLoader for async H2D prefetch (XLA only) ──
+    # MpDeviceLoader prefetches the next batch to TPU HBM *while* the current
+    # step is still computing, eliminating the synchronous H2D idle time that
+    # caps throughput at ~34k tok/s.
+    #
+    # SAFETY: This is only safe because num_workers=0 for PreTokenizedDataset
+    # and IterableDatasets. The previous crash was caused by num_workers>0:
+    #   8 ranks × 2 workers = 16 extra forked processes → RAM explosion.
+    # With num_workers=0, MpDeviceLoader uses only the existing rank processes
+    # and a small internal prefetch thread — no extra fork, no crash.
+    if device.type == "xla" and num_workers == 0:
+        try:
+            import torch_xla.distributed.parallel_loader as pl
+            dataloader = pl.MpDeviceLoader(
+                dataloader,
+                device,
+                loader_prefetch_size=2,
+                device_prefetch_size=1,
+            )
+            _slog("MpDeviceLoader wrapping applied (async H2D prefetch enabled).")
+            print("[Rhapsody] MpDeviceLoader enabled: async H2D prefetch active.")
+        except Exception as e:
+            _slog(f"WARNING: MpDeviceLoader failed, falling back to sync loader: {e}")
+            print(f"[Rhapsody] WARNING: MpDeviceLoader unavailable ({e}). Using synchronous dataloader.")
+
     # ── Prepare Accelerator ──────────────────────────────────────────────────
-    # IMPORTANT: We NEVER pass the dataloader into accelerator.prepare() on XLA/TPU.
-    # Doing so wraps it in MpDeviceLoader which spawns prefetch worker processes —
-    # on a node with 8 TPU processes, this creates 16+ extra processes and causes
-    # an OOM/crash. Instead we use a manual DistributedSampler (above) for sharding.
+    # We do NOT pass the dataloader into accelerator.prepare() — that would
+    # wrap it in a second MpDeviceLoader layer, doubling prefetch processes.
+    # We already applied MpDeviceLoader manually above.
     model, optimizer = accelerator.prepare(model, optimizer)
     _slog("accelerator.prepare() complete.")
 
