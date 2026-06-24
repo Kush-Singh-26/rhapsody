@@ -67,9 +67,9 @@ print(f"  EOS token  : {EOS}")
 # ── Streaming datasets ────────────────────────────────────────────────────────
 print("─" * 60)
 print("Opening streaming datasets (no full download)...")
-fw    = load_dataset("HuggingFaceFW/fineweb-edu",         name="sample-10BT",    split="train", streaming=True)
-dclm  = load_dataset("mlfoundations/dclm-baseline-1.0",                          split="train", streaming=True)
-cosmo = load_dataset("HuggingFaceTB/cosmopedia-v2",       name="cosmopedia-v2",   split="train", streaming=True)
+fw    = load_dataset("HuggingFaceFW/fineweb-edu",         name="sample-10BT",    split="train", streaming=True).select_columns(["text"])
+dclm  = load_dataset("mlfoundations/dclm-baseline-1.0",                          split="train", streaming=True).select_columns(["text"])
+cosmo = load_dataset("HuggingFaceTB/cosmopedia-v2",       name="cosmopedia-v2",   split="train", streaming=True).select_columns(["text"])
 mixed = interleave_datasets(
     [fw, dclm, cosmo],
     probabilities=[FINEWEB_RATIO, DCLM_RATIO, COSMO_RATIO],
