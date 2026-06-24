@@ -17,9 +17,9 @@ os.environ.pop("TPU_PROCESS_ADDRESSES", None)
 os.environ.pop("CLOUD_TPU_TASK_ID", None)
 
 # Block TensorFlow and JAX from being imported to avoid metrics aggregator conflicts on TPU.
-# We map them to a dummy MockModule in sys.modules, which prevents actual imports (which load libtpu.so)
-# while satisfying any module-level imports (like transformers.image_transforms) and tools like find_spec
-# that expect a standard module structure.
+# We map them to a dummy MockModule in sys.modules and register a MockImportFinder in sys.meta_path.
+# This prevents actual imports (which load libtpu.so) while satisfying any module-level imports
+# (like transformers.image_transforms which imports jax.numpy and tensorflow unconditionally on Kaggle).
 import sys
 import types
 from importlib.machinery import ModuleSpec
@@ -37,6 +37,21 @@ class MockModule(types.ModuleType):
 
     def __call__(self, *args, **kwargs):
         return MockModule(f"{self.__name__}.call")
+
+class MockImportFinder:
+    def __init__(self, mock_names):
+        self.mock_names = mock_names
+    def find_spec(self, fullname, path, target=None):
+        parts = fullname.split(".")
+        if parts[0] in self.mock_names:
+            return ModuleSpec(fullname, self)
+        return None
+    def create_module(self, spec):
+        return MockModule(spec.name)
+    def exec_module(self, module):
+        pass
+
+sys.meta_path.insert(0, MockImportFinder({"tensorflow", "jax", "jaxlib"}))
 
 sys.modules["tensorflow"] = MockModule("tensorflow")
 sys.modules["jax"] = MockModule("jax")
