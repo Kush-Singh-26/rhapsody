@@ -81,7 +81,7 @@ print("Datasets ready.")
 print("─" * 60)
 print(f"Target  : {TARGET_TOKENS / 1e9:.2f}B tokens")
 print(f"Shards  : {TARGET_TOKENS // SHARD_SIZE} × {SHARD_SIZE // 1_000_000}M tokens = "
-      f"{TARGET_TOKENS // SHARD_SIZE * 100} MB")
+      f"{TARGET_TOKENS // SHARD_SIZE * 200} MB")
 print(f"Out dir : {OUT_DIR}")
 print("─" * 60)
 
@@ -96,11 +96,11 @@ EXAMPLES_PER_FULL_SHARD = SHARD_SIZE // (SEQ_LEN + 1)  # packed examples
 
 
 def save_shard(data: list[int], idx: int) -> None:
-    """Save a shard as a flat int16 tensor."""
-    t = torch.tensor(data, dtype=torch.int16)
+    """Save a shard as a flat int32 tensor."""
+    t = torch.tensor(data, dtype=torch.int32)
     path = OUT_DIR / f"shard_{idx:04d}.pt"
     torch.save(t, path)
-    size_mb = t.numel() * 2 / 1024 / 1024
+    size_mb = t.numel() * 4 / 1024 / 1024
     elapsed = time.time() - t0
     rate_m  = (total_toks + len(data)) / elapsed / 1e6
     print(f"  Shard {idx:04d} saved | {size_mb:.0f} MB | "
