@@ -214,6 +214,18 @@ class GroupedQueryAttention(nn.Module):
         self.rotary_emb = rotary_emb
         self.attn_dropout_p = dropout
 
+        # Detect once whether F.scaled_dot_product_attention supports enable_gqa
+        # (added in PyTorch 2.5). Check at init to avoid try/except in the hot path.
+        self._sdpa_supports_gqa = True
+        try:
+            major, minor = map(int, torch.__version__.split(".")[:2])
+            if (major < 2) or (major == 2 and minor < 5):
+                self._sdpa_supports_gqa = False
+        except Exception:
+            pass
+
+
+
     def forward(
         self,
         x: torch.Tensor,
@@ -233,11 +245,11 @@ class GroupedQueryAttention(nn.Module):
         cos, sin = self.rotary_emb(seq_len, past_len=past_len)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        # Apply QK-Norm (RMSNorm with learnable scale parameters to bound attention logits and prevent FP16 overflow)
-        q_scale = torch.rsqrt(q.pow(2).mean(-1, keepdim=True) + 1e-6)
-        k_scale = torch.rsqrt(k.pow(2).mean(-1, keepdim=True) + 1e-6)
-        q = q * q_scale * self.q_norm_scale
-        k = k * k_scale * self.k_norm_scale
+        # Apply QK-Norm: use F.normalize (single fused kernel) instead of
+        # manual rsqrt+pow+mean which generates 3+ separate XLA ops per head.
+        # Then apply learnable per-head scale.
+        q = F.normalize(q, dim=-1) * self.q_norm_scale
+        k = F.normalize(k, dim=-1) * self.k_norm_scale
 
         # Update cache
         if past_key_value is not None:
@@ -251,18 +263,18 @@ class GroupedQueryAttention(nn.Module):
         # - mask provided → 4D additive mask [B,1,S,S] (prefix-LM, multimodal)
         # During decoding step (seq_len == 1) or when past_key_value is not None, is_causal is False.
         is_causal = (mask is None and seq_len > 1 and past_key_value is None)
-        try:
+        if self._sdpa_supports_gqa and self.num_kv_groups > 1:
             attn_output = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=mask,
                 dropout_p=self.attn_dropout_p if self.training else 0.0,
                 is_causal=is_causal,
-                enable_gqa=self.num_kv_groups > 1,
+                enable_gqa=True,
             )
-        except TypeError:
-            # PyTorch < 2.5 has no enable_gqa argument.
-            k = k.repeat_interleave(self.num_kv_groups, dim=1)
-            v = v.repeat_interleave(self.num_kv_groups, dim=1)
+        else:
+            if self.num_kv_groups > 1:
+                k = k.repeat_interleave(self.num_kv_groups, dim=1)
+                v = v.repeat_interleave(self.num_kv_groups, dim=1)
             attn_output = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=mask,
@@ -270,8 +282,8 @@ class GroupedQueryAttention(nn.Module):
                 is_causal=is_causal,
             )
 
-        # Reshape and project
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        # Reshape and project (reshape avoids a forced contiguous() copy)
+        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
         return self.o_proj(attn_output), present_key_value
 
 

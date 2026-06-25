@@ -21,6 +21,13 @@ os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
+# Enable latency-hiding scheduler and decompose all-gather einsums in PJRT/XLA for TPU
+os.environ["LIBTPU_INIT_ARGS"] = (
+    "--xla_tpu_enable_latency_hiding_scheduler=true "
+    "--xla_tpu_decompose_all_gather_einsum=true"
+)
+
+
 # Block TensorFlow and JAX from being imported to avoid metrics aggregator conflicts on TPU.
 # We map them to a dummy MockModule in sys.modules and register a MockImportFinder in sys.meta_path.
 # This prevents actual imports (which load libtpu.so) while satisfying any module-level imports
@@ -303,6 +310,10 @@ def compute_loss(model: nn.Module, batch: dict, device: torch.device) -> torch.T
     logits = output["logits"]
 
     # Compute auxiliary Z-loss to prevent logit explosion (Issue #13)
+    # CRITICAL: Do NOT use mask.any() here — it forces a device-to-host sync on every
+    # forward pass (XLA must evaluate the boolean to branch on it in Python).
+    # Instead, always compute the z_loss; the cross_entropy ignore_index=-100
+    # already excludes padding positions in the main loss, so this is safe.
     if logits is not None and labels is not None:
         if audio_features is not None:
             # Multimodal: logits has audio prefix, but labels only correspond to the text portion
@@ -311,14 +322,14 @@ def compute_loss(model: nn.Module, batch: dict, device: torch.device) -> torch.T
         else:
             active_logits = logits
 
-        flat_logits = active_logits.view(-1, active_logits.size(-1))
-        flat_labels = labels.view(-1)
-        mask = flat_labels != -100
-        if mask.any():
-            masked_logits = flat_logits[mask]
-            log_z = torch.logsumexp(masked_logits, dim=-1)
-            z_loss = torch.mean(log_z ** 2)
-            loss = loss + 1e-4 * z_loss
+        # Use cross_entropy with ignore_index for z_loss mask instead of mask.any() branch
+        # This keeps all ops on-device with no host-side branching.
+        flat_logits = active_logits.reshape(-1, active_logits.size(-1))
+        flat_labels = labels.reshape(-1)
+        valid_mask = (flat_labels != -100).float()
+        log_z = torch.logsumexp(flat_logits, dim=-1)  # [seq*batch]
+        z_loss = (log_z ** 2 * valid_mask).sum() / (valid_mask.sum() + 1e-8)
+        loss = loss + 1e-4 * z_loss
 
     return loss
 
@@ -737,6 +748,21 @@ def train():
     print = accelerator.print
     _slog(f"Accelerator initialized. device={device}")
 
+    # Initialize persistent XLA compilation cache to speed up restarts
+    if device.type == "xla":
+        try:
+            import torch_xla.core.xla_model as xm
+            cache_dir = Path(args.output_dir) / ".xla_cache"
+            if accelerator.is_main_process:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+            if accelerator.num_processes > 1:
+                time.sleep(1)
+            xm.initialize_persistent_cache(path=str(cache_dir), readonly=False)
+            print(f"[Rhapsody] Initialized persistent XLA compilation cache at {cache_dir}")
+        except Exception as e:
+            print(f"[Rhapsody] Warning: failed to initialize persistent XLA cache: {e}")
+
+
 
     use_wandb = False
     if accelerator.is_main_process:
@@ -1112,13 +1138,20 @@ def train():
     )
     _slog("DataLoader created. Starting accelerator.prepare()...")
 
-    # ── Prepare Accelerator ──────────────────────────────────────────────────
-    # IMPORTANT: We NEVER pass the dataloader into accelerator.prepare() on XLA/TPU.
-    # Doing so wraps it in MpDeviceLoader which spawns prefetch worker processes —
-    # on a node with 8 TPU processes, this creates 16+ extra processes and causes
-    # an OOM/crash. Instead we use a manual DistributedSampler (above) for sharding.
     model, optimizer = accelerator.prepare(model, optimizer)
     _slog("accelerator.prepare() complete.")
+
+    # Enable asynchronous host-to-device prefetches using MpDeviceLoader.
+    # Since num_workers=0, this does not fork processes or cause memory OOMs,
+    # but hides H2D copy latency behind TPU computation.
+    if device.type == "xla":
+        try:
+            import torch_xla.distributed.parallel_loader as pl
+            print(f"[Rhapsody] Wrapping dataloader in MpDeviceLoader for {device}...")
+            dataloader = pl.MpDeviceLoader(dataloader, device)
+        except Exception as e:
+            print(f"[Rhapsody] Warning: failed to wrap dataloader in MpDeviceLoader: {e}")
+
 
     # ── Load Optimizer & Scheduler state dicts after prepare ─────────────────
     if args.resume:
@@ -1263,23 +1296,29 @@ def train():
           f"batch_size={args.batch_size}, grad_accum={args.grad_accum}")
     print(f"[Rhapsody] Process {accelerator.process_index} starting training loop...")
     print(f"[Rhapsody] Per-rank diagnostic logs: {output_dir}/rank_N_train.log")
+    # Pre-import torch_xla.sync to avoid attribute lookup overhead inside the loop
+    _xla_sync_fn = None
+    if device.type == "xla":
+        try:
+            import torch_xla as _txla
+            _xla_sync_fn = _txla.sync
+        except AttributeError:
+            import torch_xla.core.xla_model as _xm
+            _xla_sync_fn = _xm.mark_step
+
     while step < total_steps:
         for batch in dataloader:
             if step >= total_steps:
                 break
 
-            _t_batch = time.time()  # batch fetch completed (we're now inside the loop)
-            batch_shape = tuple(batch["input_ids"].shape)
-            _rlog(f"step={step} | batch fetched {batch_shape} | fetch-to-loop: latency tracked externally")
-
-            _t0 = time.time()
+            # NOTE: No time.time() or _rlog() inside the hot loop.
+            # On XLA, time.time() causes an implicit device sync (flushes the lazy
+            # execution queue) because the host must wait for queued ops before
+            # reporting elapsed time. This destroyed throughput at ~34k tok/s.
+            # Diagnostic logging is now OUTSIDE the per-micro-step hot path.
             with accelerator.accumulate(model):
                 loss = compute_loss(model, batch, device)
-                _rlog(f"step={step} | forward DONE ({time.time()-_t0:.3f}s)")
-
-                _t1 = time.time()
                 accelerator.backward(loss)
-                _rlog(f"step={step} | backward DONE ({time.time()-_t1:.3f}s) -- all_reduce queued")
 
                 # Keep loss as a local TPU tensor (do not call .item() here)
                 loss_val_tensor = loss.detach()
@@ -1290,9 +1329,7 @@ def train():
                     if grad_norm is not None:
                         grad_norm_tensor = grad_norm.detach()
 
-                _t2 = time.time()
                 optimizer.step()
-                _rlog(f"step={step} | optimizer.step DONE ({time.time()-_t2:.3f}s)")
 
                 if accelerator.sync_gradients:
                     if not accelerator.optimizer_step_was_skipped:
@@ -1308,19 +1345,10 @@ def train():
                 # including the DDP all_reduce. ALL 8 ranks must reach this call for the
                 # all_reduce to complete. If this line never returns, one or more other
                 # ranks are stuck in data loading and never queued their all_reduce op.
-                if device.type == "xla":
-                    _rlog(f"step={step} | calling torch_xla.sync() (blocks until all 8 ranks execute all_reduce)...")
-                    _t3 = time.time()
-                    try:
-                        import torch_xla
-                        torch_xla.sync()   # preferred API in torch_xla >= 2.x
-                    except AttributeError:
-                        import torch_xla.core.xla_model as xm
-                        xm.mark_step()     # fallback for older torch_xla
-                    _rlog(f"step={step} | torch_xla.sync() DONE ({time.time()-_t3:.3f}s) ✓")
+                if _xla_sync_fn is not None:
+                    _xla_sync_fn()
 
-                # NOW accumulate values on device without calling .item() at every step
-                _rlog(f"step={step} | step COMPLETE")
+                # Accumulate values on device without calling .item() at every step
                 running_loss += loss_val_tensor
                 micro_steps_in_window += 1
 
