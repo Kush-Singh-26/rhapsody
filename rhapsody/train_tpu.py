@@ -50,6 +50,12 @@ class MockModule(types.ModuleType):
     def __call__(self, *args, **kwargs):
         return MockModule(f"{self.__name__}.call")
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
+
 class MockImportFinder:
     def __init__(self, mock_names):
         self.mock_names = mock_names
