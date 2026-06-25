@@ -247,9 +247,12 @@ class GroupedQueryAttention(nn.Module):
 
         # Apply QK-Norm: use F.normalize (single fused kernel) instead of
         # manual rsqrt+pow+mean which generates 3+ separate XLA ops per head.
-        # Then apply learnable per-head scale.
-        q = F.normalize(q, dim=-1) * self.q_norm_scale
-        k = F.normalize(k, dim=-1) * self.k_norm_scale
+        # F.normalize sets L2 norm to 1. We must multiply by sqrt(head_dim)
+        # to match RMSNorm variance, then apply the learnable scale.
+        import math
+        q_scale = math.sqrt(self.head_dim)
+        q = F.normalize(q, dim=-1) * (q_scale * self.q_norm_scale)
+        k = F.normalize(k, dim=-1) * (q_scale * self.k_norm_scale)
 
         # Update cache
         if past_key_value is not None:
