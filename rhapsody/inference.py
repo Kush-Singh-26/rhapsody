@@ -302,6 +302,10 @@ def generate_text(model, tokenizer, prompt, max_new_tokens=128, temperature=0.0,
     model.eval()
     input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
     
+    # If the tokenizer automatically appended an EOS token, strip it off so we can continue generation
+    if input_ids.shape[1] > 1 and input_ids[0, -1] == tokenizer.eos_token_id:
+        input_ids = input_ids[:, :-1]
+        
     generated_tokens = []
     past_key_values = None
     
