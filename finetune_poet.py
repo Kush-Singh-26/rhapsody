@@ -48,9 +48,9 @@ class HaikuDataset(Dataset):
         haiku = item["haiku"].replace(" / ", "\n")
         topic = extract_topic(haiku)
         
-        # Format: Write a haiku about {topic}.\n{haiku}<EOS>
         prompt = f"Write a haiku about {topic}.\n"
-        full_text = prompt + haiku
+        # Append eos_token to the end of full_text so the model learns when to stop
+        full_text = prompt + haiku + self.tokenizer.eos_token
         
         encoded = self.tokenizer(
             full_text,
@@ -59,7 +59,6 @@ class HaikuDataset(Dataset):
             padding="max_length",
             return_tensors="pt"
         )
-        
         input_ids = encoded["input_ids"].squeeze(0)
         
         # Create labels: -100 for the prompt so we only train on generating the haiku
@@ -70,14 +69,25 @@ class HaikuDataset(Dataset):
         )
         prompt_len = prompt_encoded["input_ids"].shape[1]
         
-        labels = input_ids.clone()
-        # Ensure we don't index out of bounds if prompt is longer than max_length (rare)
+        # Get length of full text without padding to know where actual text ends
+        non_padded_encoded = self.tokenizer(
+            full_text,
+            add_special_tokens=False,
+            return_tensors="pt"
+        )
+        non_padded_len = non_padded_encoded["input_ids"].shape[1]
+        
+        # Ensure we don't index out of bounds if prompt/full text is longer than max_length
         prompt_len = min(prompt_len, self.max_length)
-        labels[:prompt_len] = -100
+        non_padded_len = min(non_padded_len, self.max_length)
         
-        # Mask out padding tokens
-        labels[input_ids == self.tokenizer.pad_token_id] = -100
-        
+        labels = torch.full_like(input_ids, -100)
+        # Shifted labels: input_ids[t] predicts input_ids[t+1]
+        # We start predicting from prompt_len - 1 (predicting the first token of the haiku)
+        # We stop predicting at non_padded_len - 1 (predicting the EOS token)
+        if prompt_len - 1 < non_padded_len - 1:
+            labels[prompt_len - 1 : non_padded_len - 1] = input_ids[prompt_len : non_padded_len]
+            
         return {
             "input_ids": input_ids,
             "labels": labels
