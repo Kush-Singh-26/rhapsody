@@ -62,8 +62,8 @@ def main():
             device=args.device
         )
         
-        # Extract just the generated poem
-        generated = completion[len(prompt):].strip()
+        # generate_text only returns the newly generated tokens, so no slicing is needed
+        generated = completion.strip()
         lines = [line.strip() for line in generated.split('\n') if line.strip()]
         
         if len(lines) == 3:
