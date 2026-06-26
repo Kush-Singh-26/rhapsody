@@ -1,174 +1,113 @@
 # Rhapsody
 
-Small, lightweight audio-language model training codebase. Designed to run as a standalone repository and easily sync training checkpoints across sequential Colab and Kaggle sessions.
-
-## Tasks
-
-Rhapsody supports two task families:
-
-| Task | Description |
-|---|---|
-| **Audio Captioning** | Audio → text description (default) |
-| **Symbolic Music Generation** | Audio/text prompt → ABC notation or MIDI-like tokens |
-
-The symbolic music task uses a CLAP embedding as a style/mood conditioner and autoregressively generates structured symbolic sequences (ABC notation). This sidesteps the token-length problem of raw audio generation — symbolic sequences are short, structured, and learnable by a 65M model.
+A small, lightweight decoder-only Language Model pre-training codebase (~65M/84M parameters). Optimized for resource-friendly pre-training on GPU (single/multi-device) and TPU (v5e-8 PJRT/XLA environments) with automated checkpoint syncing across sequential Colab and Kaggle sessions.
 
 ---
 
 ## Architecture
 
-```text
-Task 1 (Audio Captioning):
-  Audio input -> CLAP encoder (frozen) -> projector -> ~65M text LM -> text output
+Rhapsody implements a deep-and-thin Transformer Language Model based on modern design principles:
 
-Task 2 (Symbolic Music):
-  Audio/text prompt -> CLAP encoder (frozen) -> projector -> ~65M text LM -> ABC notation
-```
+* **Transformer Structure**: Decoder-only architecture following Llama-like SwiGLU feed-forward networks, RMSNorm, and Rotary Position Embeddings (RoPE).
+* **Attention**: Grouped-Query Attention (GQA) with 8 query heads and 4 KV heads for memory-efficient training and high-throughput generation.
+* **Tied Embeddings**: Word embeddings are tied with the language model output head.
+* **Small Footprint**: Sized at ~65M-84M parameters with a 32K-token vocabulary using the `HuggingFaceTB/cosmo2-tokenizer`.
 
-| Component | Details |
-|---|---|
-| **Text LM** | 20 layers, 512 hidden size, 8 query heads, 4 KV heads, SwiGLU, RoPE, RMSNorm, tied embeddings |
-| **Audio Encoder** | `laion/clap-htsat-unfused` (CLAP audio tower, ~31M parameters), frozen by default |
-| **Projector** | MLP mapping CLAP embedding size 768 to LM hidden size 512 |
-| **Attention** | PyTorch SDPA with native GQA; custom prefix-LM mask for audio-conditioned text |
+---
 
-The core text model is sized to be roughly 65M parameters with a 32K-token vocabulary (using `HuggingFaceTB/cosmo2-tokenizer`).
+## Repository Structure
+
+* [rhapsody/model.py](file:///home/kush26/Projects/rhapsody/rhapsody/model.py): Core `TextLM` transformer architecture definition and configs.
+* [rhapsody/data.py](file:///home/kush26/Projects/rhapsody/rhapsody/data.py): Tokenizer loading, `TextPretrainDataset`, and `PreTokenizedDataset` for shard loading.
+* [rhapsody/inference.py](file:///home/kush26/Projects/rhapsody/rhapsody/inference.py): Text generation inference utility with KV-caching.
+* [rhapsody/train.py](file:///home/kush26/Projects/rhapsody/rhapsody/train.py): GPU/CPU training script supporting mixed precision (BF16/FP16) via HF Accelerate.
+* [rhapsody/train_tpu.py](file:///home/kush26/Projects/rhapsody/rhapsody/train_tpu.py): Performance-tuned pre-training script optimized for TPU v5e-8 (using PJRT/XLA and mock import blockers).
+* [test_training.py](file:///home/kush26/Projects/rhapsody/test_training.py) & [test_kv_cache.py](file:///home/kush26/Projects/rhapsody/test_kv_cache.py): Synthetic verification tests for training loops and KV-caching correctness.
+
+---
+
+## Optimizers & Scheduling
+
+* **Muon Optimizer**: Momentum + Newton-Schulz orthogonalisation applied to all 2D+ weight matrices (attention & FFN projections).
+* **AdamW**: Applied to scalars, embeddings, layer norms, and biases.
+* **WSD Schedule**: Warmup-Stable-Decay learning rate schedule to maximize pre-training throughput and stability.
 
 ---
 
 ## Setup & Notebook Deployment
 
-### 1. Push to your GitHub (First Time)
-Since you will be running this on remote machines (Colab/Kaggle), you need to push this repository to GitHub so it can be cloned:
-
-```bash
-# In your local /home/kush26/Projects/rhapsody directory:
-git add .
-git commit -m "Initial commit: standalone rhapsody with DDP & Clotho support"
-git branch -M main
-git remote add origin https://github.com/Kush-Singh-26/rhapsody.git
-git push -u origin main
-```
-
----
-
-### 2. Running in Colab or Kaggle (Jupyter Notebooks)
-
-You do **not** need to use `uv` on Colab/Kaggle (though you can). Standard `pip` works out-of-the-box. 
-
-Create a cell at the top of your notebook to clone your repo and install the dependencies:
+### 1. Cloned Deployment in Colab or Kaggle
+Run this in a notebook cell to clone and install:
 
 ```python
 # 1. Clone the repository
 !git clone https://github.com/Kush-Singh-26/rhapsody.git
 %cd rhapsody
 
-# 2. Log in to HuggingFace (required for gated weights/pulling checkpoints)
-!pip install huggingface_hub
-!huggingface-cli login
-
-# 3. Option A: Standard Fast Installation (Direct Pip)
+# 2. Install dependencies in editable mode
 !pip install -e .
-
-# 3. Option B: Blazing Fast Installation (Using UV)
-# !pip install uv
-# !uv pip install --system -e .
 ```
-
-*Note: The `-e .` (editable mode) flag installs the package using the `pyproject.toml` dependencies and registers the `rhapsody-train` command globally on the VM.*
-
----
-
-## Datasets
-
-By default, the training pipeline uses:
-* **Audio Captioning (default task):** 
-  * **Clotho (`soundata/clotho`):** 4,981 clips. The loader automatically extracts all **5 human captions** for each clip, yielding **~19,000 highly diverse audio-text pairs** during alignment. No YouTube downloading is required as the raw audio bytes stream directly from the Hugging Face cache.
-  * **AudioSet (`EleutherAI/...`):** Capped at 2,000 examples with native audio bytes.
-* **Symbolic Music Generation:**
-  * **ABC Notation (`Seeker38/music_abc_notation`):** 383,000 ABC tunes.
 
 ---
 
 ## Training
 
-The repository supports distributed multi-GPU training (via Hugging Face Accelerate DDP) out-of-the-box. It automatically handles mixed precision (BF16 on L4/A100, FP16 on T4) and dynamically scales dataset indices and checkpoint loading parameters.
-
-### 1. Single GPU Training (Google Colab 1x T4 / A100)
-Run standard sequential training:
+### 1. GPU/CPU Pre-training
+Run pre-training using Accelerate DDP:
 
 ```bash
-# Stage 1: Text Pretraining (TextLM only)
-rhapsody-train --stage pretrain --max-steps 100000 --batch-size 4 --grad-accum 16 --lr 0.0008
+# Single GPU or CPU training
+rhapsody-train --max-steps 100000 --batch-size 4 --grad-accum 16 --lr 0.0008
 
-# Stage 2: Audio-Text Alignment (Projector only, TextLM frozen)
-rhapsody-train --stage align --max-steps 5000 --batch-size 4 --grad-accum 8 --lr 0.0001 --pretrained-lm ./outputs/stage1/final
-
-# Stage 3: Fine-Tuning (Full multimodal model, CLAP frozen)
-rhapsody-train --stage finetune --max-steps 3000 --batch-size 2 --grad-accum 16 --lr 0.00005 --pretrained-lm ./outputs/stage2/final
+# Multi-GPU via torchrun (e.g. Kaggle 2x T4)
+torchrun --nproc_per_node=2 rhapsody/train.py --max-steps 100000 --batch-size 4 --grad-accum 8 --lr 0.0008
 ```
 
-### 2. Multi-GPU Distributed Training (Kaggle 2x T4 GPUs)
-Launch using `torchrun` to train on both GPUs in parallel:
+### 2. TPU Pre-training
+For Kaggle TPU v5e-8 PJRT multi-processing environments, run using:
 
 ```bash
-# Stage 2: Alignment (Halved grad-accum to keep global batch size at 64)
-torchrun --nproc_per_node=2 train.py --stage align --max-steps 5000 --batch-size 4 --grad-accum 8 --pretrained-lm ./outputs/stage1/final
+python rhapsody/train_tpu.py --max-steps 100000 --batch-size 8 --grad-accum 16 --pretok-dir ./pretokenized_shards
 ```
 
-*Note: Keeping the global effective batch size (`batch_size * grad_accum * num_gpus`) identical across environments prevents optimization trajectory mismatch and stabilizes learning rate schedules.*
+*Note: [train_tpu.py](file:///home/kush26/Projects/rhapsody/rhapsody/train_tpu.py) automatically patches subprocess spawning, blocks conflicting TensorFlow/JAX metrics allocators, sets thread affinity, and integrates XLA-friendly file-based checkpoint barriers to eliminate TPU hangs.*
 
 ---
 
 ## Nomad Checkpointing (`config.yaml`)
 
-This repository uses a `config.yaml` state file linked to `lm_forge` to enable robust, multi-session training. If a Colab or Kaggle session terminates:
-1. It automatically saves local checkpoints periodically.
-2. It pushes the latest checkpoint state to a designated Hugging Face Hub repository in a daemon thread.
-3. Upon restart, it pulls the latest checkpoint from the Hub and **instantly fast-forwards the dataset** (using `torch.utils.data.Subset` for Map datasets) to the exact step where it was preempted.
+Both training scripts support automated, multi-session pre-training resumption via `lm_forge` HubSync:
+1. Local checkpoints are periodically saved and pruned.
+2. The latest state is uploaded to your Hugging Face Hub repository in a background thread.
+3. Upon preemption/session restart, passing `--auto-resume --forge-config ./config.yaml` pulls the latest checkpoint and fast-forwards the dataset to the exact microstep where training left off.
 
-To run with nomad checkpointing:
 ```bash
-rhapsody-train --stage align --auto-resume --forge-config ./config.yaml --save-steps 500
+rhapsody-train --auto-resume --forge-config ./config.yaml --save-steps 500
 ```
 
-### The `config.yaml` Schema:
-```yaml
-name: "rhapsody-65m"
-state:
-  repo_id: "Kush26/rhapsody-65m-checkpoints"
-  branch: "checkpoints"
-  checkpoint_limit: 3
-  push_every: 500
-  private: true
+---
+
+## Verification & Testing
+
+Before kicking off training runs, verify model components on CPU:
+
+```bash
+# Verify the training update step and Muon orthogonal updates
+python test_training.py
+
+# Verify KV-Cache logic and output equivalence
+python test_kv_cache.py
 ```
 
 ---
 
 ## Inference
 
-### Audio Captioning
+Run local autoregressive generation on a pre-trained checkpoint:
+
 ```bash
 python -m rhapsody.inference \
   --checkpoint ./outputs/final/model.pt \
-  --audio path/to/clip.wav \
-  --prompt "Describe this audio:" \
+  --prompt "Deep learning is" \
   --max-new-tokens 128
 ```
-
-### Symbolic Music Generation
-Autoregressively generate ABC notation:
-```bash
-python -m rhapsody.inference \
-  --checkpoint ./outputs/final/model.pt \
-  --task symbolic-music \
-  --audio path/to/reference.wav \
-  --max-new-tokens 256
-```
-
----
-
-## Notes
-* `--max-steps` is the exact number of **optimizer steps** (weight updates) to perform.
-* `--lr` sets the base AdamW learning rate (for norms, biases, embeddings, and projector parameters). The Muon orthogonal learning rate for weight matrices is fixed internally at `0.015`.
-* Gradient scaling and accumulation parameters are automatically managed by the `Accelerator`. Saved checkpoints automatically strip out DDP `module.` wrappers, enabling cross-compatibility between multi-GPU and single-GPU environments.
