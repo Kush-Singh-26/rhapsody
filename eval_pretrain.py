@@ -63,11 +63,11 @@ def compute_ngram_repetition(text: str, n: int = 3) -> float:
 
 
 @torch.no_grad()
-def generate_text(model, tokenizer, prompt, max_new_tokens=128, temperature=0.0, top_p=0.9, repetition_penalty=1.15, device="cpu"):
+def generate_text(model, tokenizer, prompt, max_new_tokens=128, temperature=0.0, top_p=0.9, repetition_penalty=1.15, no_repeat_ngram_size=3, device="cpu"):
     """
     Standard autoregressive generation helper.
     Uses KV caching and supports greedy (temp=0.0) or sampling mode.
-    Applies repetition_penalty to logits of already generated tokens.
+    Applies repetition_penalty and no_repeat_ngram_size to logits.
     """
     model.eval()
     input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
@@ -81,7 +81,23 @@ def generate_text(model, tokenizer, prompt, max_new_tokens=128, temperature=0.0,
     past_key_values = outputs["past_key_values"]
     next_token_logits = logits[:, -1, :]
     
-    # Sample first token (no repetition penalty needed yet)
+    # Apply no_repeat_ngram_size to first token (using prompt context)
+    all_tokens = input_ids[0].tolist()
+    if no_repeat_ngram_size > 0 and len(all_tokens) >= no_repeat_ngram_size:
+        last_tokens = all_tokens[-(no_repeat_ngram_size - 1):]
+        banned_tokens = []
+        for i in range(len(all_tokens) - no_repeat_ngram_size + 1):
+            window = all_tokens[i : i + no_repeat_ngram_size - 1]
+            if window == last_tokens:
+                banned_token = all_tokens[i + no_repeat_ngram_size - 1]
+                banned_tokens.append(banned_token)
+        if banned_tokens:
+            temp_logits = next_token_logits.clone()
+            temp_logits[0, banned_tokens] = float("-inf")
+            if not torch.all(torch.isinf(temp_logits)):
+                next_token_logits = temp_logits
+                
+    # Sample first token
     if temperature == 0.0:
         next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
     else:
@@ -122,6 +138,22 @@ def generate_text(model, tokenizer, prompt, max_new_tokens=128, temperature=0.0,
                     next_token_logits[0, token_id] = logit / repetition_penalty
                 else:
                     next_token_logits[0, token_id] = logit * repetition_penalty
+                    
+        # Apply no_repeat_ngram_size
+        all_tokens = input_ids[0].tolist() + generated_tokens
+        if no_repeat_ngram_size > 0 and len(all_tokens) >= no_repeat_ngram_size:
+            last_tokens = all_tokens[-(no_repeat_ngram_size - 1):]
+            banned_tokens = []
+            for i in range(len(all_tokens) - no_repeat_ngram_size + 1):
+                window = all_tokens[i : i + no_repeat_ngram_size - 1]
+                if window == last_tokens:
+                    banned_token = all_tokens[i + no_repeat_ngram_size - 1]
+                    banned_tokens.append(banned_token)
+            if banned_tokens:
+                temp_logits = next_token_logits.clone()
+                temp_logits[0, banned_tokens] = float("-inf")
+                if not torch.all(torch.isinf(temp_logits)):
+                    next_token_logits = temp_logits
         
         if temperature == 0.0:
             next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
@@ -203,12 +235,18 @@ def evaluate_perplexity(model, tokenizer, device, seq_len=1024, stride=512):
         if cur_seq_len <= 1:
             break
             
+        # Check active tokens in this window
+        mask_idx = prev_end_loc - begin_loc - 1
+        num_active = (cur_seq_len - 1) - max(0, mask_idx)
+        if num_active <= 0:
+            prev_end_loc = end_loc
+            continue
+            
         seq = input_ids[:, begin_loc:end_loc]
         inputs = seq[:, :-1]
         labels = seq[:, 1:].clone()
         
         # Mask out target tokens that were predicted in previous steps
-        mask_idx = prev_end_loc - begin_loc - 1
         if mask_idx > 0:
             labels[:, :mask_idx] = -100
             
@@ -216,7 +254,6 @@ def evaluate_perplexity(model, tokenizer, device, seq_len=1024, stride=512):
             outputs = model(inputs, labels=labels)
             loss = outputs["loss"]
             
-        num_active = (cur_seq_len - 1) - max(0, mask_idx)
         total_nll += loss.item() * num_active
         total_active_tokens += num_active
         prev_end_loc = end_loc
@@ -333,7 +370,7 @@ def evaluate_sst2(model, tokenizer, device, max_samples=100):
     return accuracy
 
 
-def evaluate_ner(model, tokenizer, device, max_samples=20, repetition_penalty=1.15):
+def evaluate_ner(model, tokenizer, device, max_samples=20, repetition_penalty=1.15, no_repeat_ngram_size=3):
     """Tier 4.2: 3-shot Named Entity Recognition (NER) on CoNLL-2003 validation split."""
     try:
         from datasets import load_dataset
@@ -469,6 +506,7 @@ def evaluate_ner(model, tokenizer, device, max_samples=20, repetition_penalty=1.
             max_new_tokens=50,
             temperature=0.0,
             repetition_penalty=repetition_penalty,
+            no_repeat_ngram_size=no_repeat_ngram_size,
             device=device
         )
         
@@ -493,7 +531,7 @@ def evaluate_ner(model, tokenizer, device, max_samples=20, repetition_penalty=1.
     return avg_f1
 
 
-def evaluate_summarization(model, tokenizer, device, max_samples=10, repetition_penalty=1.15):
+def evaluate_summarization(model, tokenizer, device, max_samples=10, repetition_penalty=1.15, no_repeat_ngram_size=3):
     """Tier 4.3: 2-shot dialogue summarization evaluated with pure Python ROUGE-L."""
     try:
         from datasets import load_dataset
@@ -561,6 +599,7 @@ def evaluate_summarization(model, tokenizer, device, max_samples=10, repetition_
             max_new_tokens=100,
             temperature=0.0,
             repetition_penalty=repetition_penalty,
+            no_repeat_ngram_size=no_repeat_ngram_size,
             device=device
         )
         
@@ -572,7 +611,7 @@ def evaluate_summarization(model, tokenizer, device, max_samples=10, repetition_
     return avg_rouge_l
 
 
-def run_qualitative_prompts(model, tokenizer, device, repetition_penalty=1.15):
+def run_qualitative_prompts(model, tokenizer, device, repetition_penalty=1.15, no_repeat_ngram_size=3):
     """Tier 1 (Qualitative checks) & Tier 3 (N-gram repetition computation)"""
     print("\n" + "="*50)
     print("Tier 1 & Tier 3: Qualitative Prompts & Repetition Scores")
@@ -602,6 +641,7 @@ def run_qualitative_prompts(model, tokenizer, device, repetition_penalty=1.15):
             max_new_tokens=128,
             temperature=0.3,
             repetition_penalty=repetition_penalty,
+            no_repeat_ngram_size=no_repeat_ngram_size,
             device=device
         )
         rep_3g = compute_ngram_repetition(completion, n=3)
@@ -654,14 +694,17 @@ def main():
                         help="Skip WikiText-103 perplexity evaluation (saves time)")
     parser.add_argument("--repetition-penalty", type=float, default=1.15,
                         help="Repetition penalty for autoregressive text generation (default: 1.15)")
+    parser.add_argument("--no-repeat-ngram-size", type=int, default=3,
+                        help="N-gram size to prevent repeating (default: 3, use 0 to disable)")
     args = parser.parse_args()
     
     print("="*60)
     print(" RHAPSODY PRETRAINED MODEL EVALUATION SUITE ")
     print("="*60)
-    print(f"Checkpoint:          {args.checkpoint}")
-    print(f"Device:              {args.device}")
-    print(f"Repetition Penalty:  {args.repetition_penalty}")
+    print(f"Checkpoint:             {args.checkpoint}")
+    print(f"Device:                 {args.device}")
+    print(f"Repetition Penalty:     {args.repetition_penalty}")
+    print(f"No Repeat N-Gram Size:  {args.no_repeat_ngram_size}")
     
     if args.device == "cpu":
         print("\n[WARNING] You are running on CPU.")
@@ -681,7 +724,9 @@ def main():
     results = {}
     
     # Tier 1 & 3: Qualitative & Repetitions
-    qualitative_results, avg_rep_3g, avg_rep_4g = run_qualitative_prompts(model, tokenizer, args.device, repetition_penalty=args.repetition_penalty)
+    qualitative_results, avg_rep_3g, avg_rep_4g = run_qualitative_prompts(
+        model, tokenizer, args.device, repetition_penalty=args.repetition_penalty, no_repeat_ngram_size=args.no_repeat_ngram_size
+    )
     results["avg_rep_3g"] = avg_rep_3g
     results["avg_rep_4g"] = avg_rep_4g
     
@@ -698,11 +743,17 @@ def main():
     results["sst2_accuracy"] = sst2_acc
     
     # Tier 4.2: NER F1
-    ner_f1 = evaluate_ner(model, tokenizer, args.device, max_samples=args.max_ner, repetition_penalty=args.repetition_penalty)
+    ner_f1 = evaluate_ner(
+        model, tokenizer, args.device, max_samples=args.max_ner,
+        repetition_penalty=args.repetition_penalty, no_repeat_ngram_size=args.no_repeat_ngram_size
+    )
     results["ner_f1"] = ner_f1
     
     # Tier 4.3: Summarization ROUGE-L
-    sum_rouge_l = evaluate_summarization(model, tokenizer, args.device, max_samples=args.max_sum, repetition_penalty=args.repetition_penalty)
+    sum_rouge_l = evaluate_summarization(
+        model, tokenizer, args.device, max_samples=args.max_sum,
+        repetition_penalty=args.repetition_penalty, no_repeat_ngram_size=args.no_repeat_ngram_size
+    )
     results["summarization_rouge_l"] = sum_rouge_l
     
     # Final Summary Report
