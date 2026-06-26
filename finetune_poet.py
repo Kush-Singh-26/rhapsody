@@ -87,7 +87,7 @@ def main():
     parser = argparse.ArgumentParser(description="Fine-tune Rhapsody to be a Constraint Poet (Haiku).")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to pre-trained model.pt")
     parser.add_argument("--output-dir", type=str, default="outputs_poet", help="Output directory")
-    parser.add_argument("--batch-size", type=int, default=16, help="Batch size")
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
     parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate")
     parser.add_argument("--max-samples", type=int, default=50000, help="Max samples to train on")
@@ -124,49 +124,60 @@ def main():
     print(f"[4] Setting up optimizer (AdamW)...")
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     
+    def save_checkpoint(model, args, suffix=""):
+        out_path = os.path.join(args.output_dir, f"poet_model{suffix}.safetensors")
+        print(f"[\u2714] Saving model to {out_path}...")
+        try:
+            from safetensors.torch import save_file
+            tensors = {k: v.cpu().contiguous() for k, v in model.state_dict().items()}
+            save_file(tensors, out_path)
+        except ImportError:
+            print("[Warning] safetensors not installed, saving as .pt instead.")
+            out_path = os.path.join(args.output_dir, f"poet_model{suffix}.pt")
+            save_dict = {
+                "model": model.state_dict(),
+                "config": model.config.__dict__ if hasattr(model, 'config') else {}
+            }
+            torch.save(save_dict, out_path)
+    
     print(f"[5] Starting training on {args.device}...")
     global_step = 0
     total_steps = len(train_loader) * args.epochs
     
-    for epoch in range(args.epochs):
-        epoch_loss = 0.0
-        for batch_idx, batch in enumerate(train_loader):
-            input_ids = batch["input_ids"].to(args.device)
-            labels = batch["labels"].to(args.device)
-            
-            optimizer.zero_grad()
-            outputs = model(input_ids, labels=labels)
-            loss = outputs["loss"]
-            
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            
-            epoch_loss += loss.item()
-            global_step += 1
-            
-            if global_step % 50 == 0:
-                print(f"Epoch [{epoch+1}/{args.epochs}] Step [{global_step}/{total_steps}] Loss: {loss.item():.4f}")
-                
-        avg_loss = epoch_loss / len(train_loader)
-        print(f"==> Epoch {epoch+1} Average Loss: {avg_loss:.4f}")
-        
-    out_path = os.path.join(args.output_dir, "poet_model.safetensors")
-    
-    print(f"[6] Saving fine-tuned model to {out_path}...")
     try:
-        from safetensors.torch import save_file
-        # Ensure tensors are contiguous and on CPU before saving
-        tensors = {k: v.cpu().contiguous() for k, v in model.state_dict().items()}
-        save_file(tensors, out_path)
-    except ImportError:
-        print("[Warning] safetensors not installed, saving as .pt instead.")
-        out_path = os.path.join(args.output_dir, "poet_model.pt")
-        save_dict = {
-            "model": model.state_dict(),
-            "config": model.config.__dict__ if hasattr(model, 'config') else {}
-        }
-        torch.save(save_dict, out_path)
+        for epoch in range(args.epochs):
+            epoch_loss = 0.0
+            for batch_idx, batch in enumerate(train_loader):
+                input_ids = batch["input_ids"].to(args.device)
+                labels = batch["labels"].to(args.device)
+                
+                optimizer.zero_grad()
+                outputs = model(input_ids, labels=labels)
+                loss = outputs["loss"]
+                
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                
+                epoch_loss += loss.item()
+                global_step += 1
+                
+                if global_step % 50 == 0:
+                    print(f"Epoch [{epoch+1}/{args.epochs}] Step [{global_step}/{total_steps}] Loss: {loss.item():.4f}")
+                    
+            avg_loss = epoch_loss / len(train_loader)
+            print(f"==> Epoch {epoch+1} Average Loss: {avg_loss:.4f}")
+            # Save checkpoint at end of epoch
+            save_checkpoint(model, args, suffix=f"_epoch_{epoch+1}")
+            
+    except KeyboardInterrupt:
+        print("\n[!] Training interrupted by user!")
+        save_checkpoint(model, args, suffix="_interrupted")
+        print("Safely exited and saved interrupted checkpoint.")
+        return
+        
+    print(f"[6] Saving final fine-tuned model...")
+    save_checkpoint(model, args)
     print("Done!")
 
 if __name__ == "__main__":
