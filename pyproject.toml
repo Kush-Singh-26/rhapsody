@@ -1,7 +1,7 @@
 [project]
 name = "rhapsody"
 version = "0.1.0"
-description = "Small audio-language model training code"
+description = "Small text language model pre-training code"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -16,7 +16,6 @@ dependencies = [
     "sentencepiece>=0.1.99",
     "tokenizers>=0.15.0",
     "torch>=2.0.0",
-    "torchaudio>=2.0.0",
     "transformers>=4.40.0",
     "zstandard>=0.18.0",
 ]

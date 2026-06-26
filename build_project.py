@@ -98,7 +98,6 @@ tokenizers>=0.15.0
 pyyaml>=6.0
 python-dotenv>=1.0.0
 numpy>=1.24.0,<2.0.0
-torchaudio>=2.0.0
 sentencepiece>=0.1.99
 protobuf>=3.20.0
 
