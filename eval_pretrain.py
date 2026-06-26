@@ -63,10 +63,11 @@ def compute_ngram_repetition(text: str, n: int = 3) -> float:
 
 
 @torch.no_grad()
-def generate_text(model, tokenizer, prompt, max_new_tokens=128, temperature=0.0, top_p=0.9, device="cpu"):
+def generate_text(model, tokenizer, prompt, max_new_tokens=128, temperature=0.0, top_p=0.9, repetition_penalty=1.15, device="cpu"):
     """
     Standard autoregressive generation helper.
     Uses KV caching and supports greedy (temp=0.0) or sampling mode.
+    Applies repetition_penalty to logits of already generated tokens.
     """
     model.eval()
     input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
@@ -80,7 +81,7 @@ def generate_text(model, tokenizer, prompt, max_new_tokens=128, temperature=0.0,
     past_key_values = outputs["past_key_values"]
     next_token_logits = logits[:, -1, :]
     
-    # Sample first token
+    # Sample first token (no repetition penalty needed yet)
     if temperature == 0.0:
         next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
     else:
@@ -112,6 +113,16 @@ def generate_text(model, tokenizer, prompt, max_new_tokens=128, temperature=0.0,
         past_key_values = outputs["past_key_values"]
         next_token_logits = logits[:, -1, :]
         
+        # Apply repetition penalty to already generated tokens
+        if repetition_penalty != 1.0 and len(generated_tokens) > 0:
+            next_token_logits = next_token_logits.clone()
+            for token_id in set(generated_tokens):
+                logit = next_token_logits[0, token_id]
+                if logit > 0:
+                    next_token_logits[0, token_id] = logit / repetition_penalty
+                else:
+                    next_token_logits[0, token_id] = logit * repetition_penalty
+        
         if temperature == 0.0:
             next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
         else:
@@ -137,7 +148,7 @@ def generate_text(model, tokenizer, prompt, max_new_tokens=128, temperature=0.0,
 # =============================================================================
 
 def evaluate_perplexity(model, tokenizer, device, seq_len=1024, stride=512):
-    """Tier 2: Compute sliding-window perplexity over WikiText-103 test split."""
+    """Tier 2: Compute sliding-window perplexity over WikiText-103 test split using Salesforce namespace."""
     try:
         from datasets import load_dataset
     except ImportError:
@@ -149,12 +160,13 @@ def evaluate_perplexity(model, tokenizer, device, seq_len=1024, stride=512):
     print("="*50)
     
     try:
-        dataset = load_dataset("wikitext", "wikitext-103-raw-v1", split="test")
+        # Load from canonical Salesforce/wikitext repository
+        dataset = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split="test")
     except Exception as e:
         print(f"[Warning] Failed to load WikiText-103 test split: {e}")
-        print("Falling back to WikiText-2...")
+        print("Falling back to Salesforce/wikitext-2...")
         try:
-            dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+            dataset = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
         except Exception as e2:
             print(f"[Error] Failed to load fallback dataset WikiText-2: {e2}")
             return float('nan')
@@ -233,7 +245,11 @@ def evaluate_sst2(model, tokenizer, device, max_samples=100):
     print("="*50)
     
     try:
-        sst2 = load_dataset("glue", "sst2", split="validation")
+        # Try nyu-mll/glue first, fall back to glue
+        try:
+            sst2 = load_dataset("nyu-mll/glue", "sst2", split="validation")
+        except Exception:
+            sst2 = load_dataset("glue", "sst2", split="validation")
     except Exception as e:
         print(f"[Warning] Failed to load SST-2 from HF GLUE: {e}")
         print("Using synthetic fallback samples...")
@@ -317,7 +333,7 @@ def evaluate_sst2(model, tokenizer, device, max_samples=100):
     return accuracy
 
 
-def evaluate_ner(model, tokenizer, device, max_samples=20):
+def evaluate_ner(model, tokenizer, device, max_samples=20, repetition_penalty=1.15):
     """Tier 4.2: 3-shot Named Entity Recognition (NER) on CoNLL-2003 validation split."""
     try:
         from datasets import load_dataset
@@ -330,7 +346,11 @@ def evaluate_ner(model, tokenizer, device, max_samples=20):
     print("="*50)
     
     try:
-        ner_dataset = load_dataset("conll2003", split="validation")
+        # Try script-less lhoestq/conll2003 first, fall back to conll2003
+        try:
+            ner_dataset = load_dataset("lhoestq/conll2003", split="validation")
+        except Exception:
+            ner_dataset = load_dataset("conll2003", split="validation", trust_remote_code=True)
     except Exception as e:
         print(f"[Warning] Failed to load CoNLL-2003: {e}")
         print("Using synthetic fallback samples...")
@@ -448,6 +468,7 @@ def evaluate_ner(model, tokenizer, device, max_samples=20):
             prompt=prompt,
             max_new_tokens=50,
             temperature=0.0,
+            repetition_penalty=repetition_penalty,
             device=device
         )
         
@@ -472,7 +493,7 @@ def evaluate_ner(model, tokenizer, device, max_samples=20):
     return avg_f1
 
 
-def evaluate_summarization(model, tokenizer, device, max_samples=10):
+def evaluate_summarization(model, tokenizer, device, max_samples=10, repetition_penalty=1.15):
     """Tier 4.3: 2-shot dialogue summarization evaluated with pure Python ROUGE-L."""
     try:
         from datasets import load_dataset
@@ -485,7 +506,11 @@ def evaluate_summarization(model, tokenizer, device, max_samples=10):
     print("="*50)
     
     try:
-        samsum = load_dataset("samsum", split="test")
+        # Try knkarthick/samsum first, fall back to samsum
+        try:
+            samsum = load_dataset("knkarthick/samsum", split="test")
+        except Exception:
+            samsum = load_dataset("samsum", split="test")
     except Exception as e:
         print(f"[Warning] Failed to load SAMSum dataset: {e}")
         print("Using synthetic fallback samples...")
@@ -535,6 +560,7 @@ def evaluate_summarization(model, tokenizer, device, max_samples=10):
             prompt=prompt,
             max_new_tokens=100,
             temperature=0.0,
+            repetition_penalty=repetition_penalty,
             device=device
         )
         
@@ -546,7 +572,7 @@ def evaluate_summarization(model, tokenizer, device, max_samples=10):
     return avg_rouge_l
 
 
-def run_qualitative_prompts(model, tokenizer, device):
+def run_qualitative_prompts(model, tokenizer, device, repetition_penalty=1.15):
     """Tier 1 (Qualitative checks) & Tier 3 (N-gram repetition computation)"""
     print("\n" + "="*50)
     print("Tier 1 & Tier 3: Qualitative Prompts & Repetition Scores")
@@ -575,6 +601,7 @@ def run_qualitative_prompts(model, tokenizer, device):
             prompt=prompt,
             max_new_tokens=128,
             temperature=0.3,
+            repetition_penalty=repetition_penalty,
             device=device
         )
         rep_3g = compute_ngram_repetition(completion, n=3)
@@ -625,13 +652,16 @@ def main():
                         help="Max validation samples for Summarization evaluation (default: 10)")
     parser.add_argument("--skip-perplexity", action="store_true",
                         help="Skip WikiText-103 perplexity evaluation (saves time)")
+    parser.add_argument("--repetition-penalty", type=float, default=1.15,
+                        help="Repetition penalty for autoregressive text generation (default: 1.15)")
     args = parser.parse_args()
     
     print("="*60)
     print(" RHAPSODY PRETRAINED MODEL EVALUATION SUITE ")
     print("="*60)
-    print(f"Checkpoint: {args.checkpoint}")
-    print(f"Device:     {args.device}")
+    print(f"Checkpoint:          {args.checkpoint}")
+    print(f"Device:              {args.device}")
+    print(f"Repetition Penalty:  {args.repetition_penalty}")
     
     if args.device == "cpu":
         print("\n[WARNING] You are running on CPU.")
@@ -651,7 +681,7 @@ def main():
     results = {}
     
     # Tier 1 & 3: Qualitative & Repetitions
-    qualitative_results, avg_rep_3g, avg_rep_4g = run_qualitative_prompts(model, tokenizer, args.device)
+    qualitative_results, avg_rep_3g, avg_rep_4g = run_qualitative_prompts(model, tokenizer, args.device, repetition_penalty=args.repetition_penalty)
     results["avg_rep_3g"] = avg_rep_3g
     results["avg_rep_4g"] = avg_rep_4g
     
@@ -668,11 +698,11 @@ def main():
     results["sst2_accuracy"] = sst2_acc
     
     # Tier 4.2: NER F1
-    ner_f1 = evaluate_ner(model, tokenizer, args.device, max_samples=args.max_ner)
+    ner_f1 = evaluate_ner(model, tokenizer, args.device, max_samples=args.max_ner, repetition_penalty=args.repetition_penalty)
     results["ner_f1"] = ner_f1
     
     # Tier 4.3: Summarization ROUGE-L
-    sum_rouge_l = evaluate_summarization(model, tokenizer, args.device, max_samples=args.max_sum)
+    sum_rouge_l = evaluate_summarization(model, tokenizer, args.device, max_samples=args.max_sum, repetition_penalty=args.repetition_penalty)
     results["summarization_rouge_l"] = sum_rouge_l
     
     # Final Summary Report
