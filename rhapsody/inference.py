@@ -26,11 +26,16 @@ def load_audio(path: str, target_sr: int = 48000) -> torch.Tensor:
 
 def load_model(checkpoint_path: str, device: str = "cpu") -> torch.nn.Module:
     """Load model from a checkpoint, auto-detecting TextLM vs RhapsodyModel."""
-    # Use weights_only=False to ensure compatibility with custom checkpoint metadata (like python_random_state)
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    config_dict = {}
     
-    config_dict = checkpoint.get("config", {})
-    state_dict = checkpoint.get("model", checkpoint)  # Fallback if saved directly
+    if str(checkpoint_path).endswith('.safetensors'):
+        from safetensors.torch import load_file
+        state_dict = load_file(checkpoint_path, device=device)
+    else:
+        # Use weights_only=False to ensure compatibility with custom checkpoint metadata (like python_random_state)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        config_dict = checkpoint.get("config", {})
+        state_dict = checkpoint.get("model", checkpoint)  # Fallback if saved directly
     
     # Check if checkpoint is multimodal by looking for audio-related parameters
     is_multimodal = any("audio_encoder" in k or "projector" in k for k in state_dict.keys())
