@@ -292,5 +292,118 @@ def main():
                 print("\n[WARN] ABC syntax may be incomplete or invalid.")
 
 
+@torch.no_grad()
+def generate_text(model, tokenizer, prompt, max_new_tokens=128, temperature=0.0, top_p=0.9, repetition_penalty=1.15, no_repeat_ngram_size=3, device="cpu"):
+    """
+    Standard autoregressive generation helper.
+    Uses KV caching and supports greedy (temp=0.0) or sampling mode.
+    Applies repetition_penalty and no_repeat_ngram_size to logits.
+    """
+    model.eval()
+    input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
+    
+    generated_tokens = []
+    past_key_values = None
+    
+    # Pre-fill
+    outputs = model(input_ids, use_cache=True)
+    logits = outputs["logits"]
+    past_key_values = outputs["past_key_values"]
+    next_token_logits = logits[:, -1, :]
+    
+    # Apply no_repeat_ngram_size to first token (using prompt context)
+    all_tokens = input_ids[0].tolist()
+    if no_repeat_ngram_size > 0 and len(all_tokens) >= no_repeat_ngram_size:
+        last_tokens = all_tokens[-(no_repeat_ngram_size - 1):]
+        banned_tokens = []
+        for i in range(len(all_tokens) - no_repeat_ngram_size + 1):
+            window = all_tokens[i : i + no_repeat_ngram_size - 1]
+            if window == last_tokens:
+                banned_token = all_tokens[i + no_repeat_ngram_size - 1]
+                banned_tokens.append(banned_token)
+        if banned_tokens:
+            temp_logits = next_token_logits.clone()
+            temp_logits[0, banned_tokens] = float("-inf")
+            if not torch.all(torch.isinf(temp_logits)):
+                next_token_logits = temp_logits
+                
+    # Sample first token
+    if temperature == 0.0:
+        next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+    else:
+        next_token_logits = next_token_logits / temperature
+        if top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True, dim=-1)
+            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            sorted_indices_to_remove = cumulative_probs > top_p
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = 0
+            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+            next_token_logits = next_token_logits.masked_fill(indices_to_remove, float("-inf"))
+        probs = F.softmax(next_token_logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)
+        
+    generated_tokens.append(next_token.item())
+    
+    eos_tokens = {tokenizer.eos_token_id}
+    abc_end_id = tokenizer.convert_tokens_to_ids("<|abc_end|>")
+    if abc_end_id != tokenizer.unk_token_id:
+        eos_tokens.add(abc_end_id)
+        
+    for _ in range(1, max_new_tokens):
+        if next_token.item() in eos_tokens:
+            break
+            
+        outputs = model(next_token, past_key_values=past_key_values, use_cache=True)
+        logits = outputs["logits"]
+        past_key_values = outputs["past_key_values"]
+        next_token_logits = logits[:, -1, :]
+        
+        # Apply repetition penalty to already generated tokens
+        if repetition_penalty != 1.0 and len(generated_tokens) > 0:
+            next_token_logits = next_token_logits.clone()
+            for token_id in set(generated_tokens):
+                logit = next_token_logits[0, token_id]
+                if logit > 0:
+                    next_token_logits[0, token_id] = logit / repetition_penalty
+                else:
+                    next_token_logits[0, token_id] = logit * repetition_penalty
+                    
+        # Apply no_repeat_ngram_size
+        all_tokens = input_ids[0].tolist() + generated_tokens
+        if no_repeat_ngram_size > 0 and len(all_tokens) >= no_repeat_ngram_size:
+            last_tokens = all_tokens[-(no_repeat_ngram_size - 1):]
+            banned_tokens = []
+            for i in range(len(all_tokens) - no_repeat_ngram_size + 1):
+                window = all_tokens[i : i + no_repeat_ngram_size - 1]
+                if window == last_tokens:
+                    banned_token = all_tokens[i + no_repeat_ngram_size - 1]
+                    banned_tokens.append(banned_token)
+            if banned_tokens:
+                temp_logits = next_token_logits.clone()
+                temp_logits[0, banned_tokens] = float("-inf")
+                if not torch.all(torch.isinf(temp_logits)):
+                    next_token_logits = temp_logits
+        
+        if temperature == 0.0:
+            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+        else:
+            next_token_logits = next_token_logits / temperature
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True, dim=-1)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                next_token_logits = next_token_logits.masked_fill(indices_to_remove, float("-inf"))
+            probs = F.softmax(next_token_logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            
+        generated_tokens.append(next_token.item())
+        
+    return tokenizer.decode(generated_tokens, skip_special_tokens=True)
+
+
 if __name__ == "__main__":
     main()
