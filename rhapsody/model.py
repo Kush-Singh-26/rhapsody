@@ -757,7 +757,7 @@ def create_rhapsody_65m(vocab_size: int = 32000) -> RhapsodyModel:
     return RhapsodyModel(config)
 
 
-def create_text_only_65m(vocab_size: int = 32000) -> TextLM:
+def create_text_only_65m(vocab_size: int = 49155) -> TextLM:
     """Create the text-only 65M LM (for Stage 1 pretraining)."""
     config = RhapsodyConfig(
         hidden_size=512,
