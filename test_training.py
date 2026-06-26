@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from rhapsody.model import create_text_only_65m, create_rhapsody_65m
+from rhapsody.model import create_text_only_65m
 from rhapsody.train import Muon, get_wsd_lr, compute_loss
 
 def run_synthetic_training():

@@ -1,16 +1,15 @@
-"""Rhapsody Data Pipeline."""
+"""Rhapsody Text-only Data Pipeline."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Optional
-import json
 
 import torch
 from torch.utils.data import Dataset, IterableDataset
 from datasets import load_dataset, interleave_datasets
 from transformers import AutoTokenizer
-import torchaudio
 
 
 def get_tokenizer(symbolic: bool = False) -> AutoTokenizer:
@@ -26,20 +25,6 @@ def get_tokenizer(symbolic: bool = False) -> AutoTokenizer:
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
 
     special = ["<|pad|>", "<|audio|>", "<|text|>"]
-    if symbolic:
-        special.extend(
-            [
-                "<|music|>",
-                "<|abc_start|>",
-                "<|abc_end|>",
-                "<|midi_start|>",
-                "<|midi_end|>",
-                "<|style|>",
-                "<|key|>",
-                "<|meter|>",
-                "<|tempo|>",
-            ]
-        )
     num_added = tokenizer.add_special_tokens({"additional_special_tokens": special})
     if num_added > 0:
         print(f"[Rhapsody] Added {num_added} special tokens")
@@ -53,17 +38,7 @@ def get_tokenizer(symbolic: bool = False) -> AutoTokenizer:
 class TextPretrainDataset(IterableDataset):
     """
     Streaming interleaved dataset for Stage-1 text pretraining.
-
-    Mixes FineWeb-Edu, DCLM-Baseline, Stack-Edu, and Cosmopedia v2.
-    Uses token-packing: tokens are buffered and sliced into fixed-length
-    chunks with no wasted padding. An EOS token is appended at each
-    document boundary so the model learns clean end-of-document signals.
-
-    Labels are PRE-SHIFTED:
-      input_ids[t]  = token t
-      labels[t]     = token t+1   (i.e., the next token to predict)
-    This is consistent with AudioTextDataset and avoids double-shifting
-    in the loss computation.
+    Mixes FineWeb-Edu, DCLM-Baseline, and Cosmopedia v2.
     """
 
     def __init__(
@@ -79,16 +54,8 @@ class TextPretrainDataset(IterableDataset):
         self.tokenizer = tokenizer
         self.seq_len = seq_len
 
-        # Calculate approximate documents to skip based on dataset densities
         total_tokens_to_skip = resume_step * global_batch_size * seq_len
 
-        # Resolve distributed sharding info BEFORE loading datasets.
-        # CRITICAL: split_dataset_by_node must be applied to each sub-dataset INDIVIDUALLY
-        # before interleave_datasets. Applying it to the interleaved result does not properly
-        # expose file-level shards on all ranks, causing some ranks (1-7) to get empty or
-        # misaligned data. An empty dataset causes those ranks to skip the training loop
-        # body entirely, so they never call xm.sync(), and the DDP all_reduce in process 0
-        # blocks forever.
         try:
             from accelerate import PartialState
             from datasets.distributed import split_dataset_by_node as _split_by_node
@@ -198,19 +165,17 @@ class TextPretrainDataset(IterableDataset):
                 )
                 tokens = tokenized["input_ids"]
 
-                # Append EOS at document boundary so the model learns when docs end
                 if eos_id is not None:
                     tokens = tokens + [eos_id]
 
                 buffer.extend(tokens)
 
-                # Yield fixed-length chunks with pre-shifted labels
                 while len(buffer) >= self.seq_len + 1:
                     chunk = buffer[: self.seq_len + 1]
-                    buffer = buffer[self.seq_len:]   # advance by seq_len (1-token overlap is intentional)
+                    buffer = buffer[self.seq_len:]
 
-                    input_ids = torch.tensor(chunk[:-1], dtype=torch.long)  # [seq_len]
-                    labels    = torch.tensor(chunk[1:],  dtype=torch.long)  # [seq_len], pre-shifted
+                    input_ids = torch.tensor(chunk[:-1], dtype=torch.long)
+                    labels    = torch.tensor(chunk[1:],  dtype=torch.long)
 
                     yield {"input_ids": input_ids, "labels": labels}
 
@@ -218,20 +183,6 @@ class TextPretrainDataset(IterableDataset):
 class PreTokenizedDataset(Dataset):
     """
     Map-style dataset backed by pre-tokenized int16 shard files.
-
-    Created by pretokenize.py. Each shard is a flat int16 tensor of
-    SHARD_SIZE tokens (document-packed, EOS-delimited, no padding).
-    __getitem__(i) extracts a (seq_len + 1) window from the right shard
-    and splits it into pre-shifted input_ids / labels.
-
-    Advantages over streaming TextPretrainDataset:
-      • Reads from local disk — zero network I/O during training.
-      • Map-style → compatible with num_workers > 0 and MpDeviceLoader.
-      • already_fast_forwarded = True — tells train_tpu.py this dataset
-        already starts at the correct resume point; no Subset skipping needed.
-
-    RAM usage: 2-shard LRU cache per DataLoader worker.
-    Each shard ≈ 100 MB (int16) → ~200 MB cache per worker at default settings.
     """
 
     already_fast_forwarded: bool = True
@@ -239,7 +190,7 @@ class PreTokenizedDataset(Dataset):
     def __init__(self, shard_dir: str, seq_len: int = 1024):
         self.shard_dir = Path(shard_dir)
         self.seq_len   = seq_len
-        self.chunk_len = seq_len + 1          # tokens per example: input + 1 label overlap
+        self.chunk_len = seq_len + 1
 
         meta_path = self.shard_dir / "meta.json"
         if not meta_path.exists():
@@ -248,421 +199,58 @@ class PreTokenizedDataset(Dataset):
                 "Run pretokenize.py first."
             )
         meta = json.loads(meta_path.read_text())
-
-        self.shard_size            = meta["shard_size_tokens"]
-        self.examples_per_shard    = meta["examples_per_full_shard"]
-        self.last_shard_examples   = meta.get("last_shard_examples", self.examples_per_shard)
+        self.total_tokens = meta["total_tokens"]
+        self.shard_size   = meta["shard_size"]
+        self.num_samples  = (self.total_tokens - 1) // self.seq_len
 
         self.shard_paths = sorted(self.shard_dir.glob("shard_*.pt"))
         if not self.shard_paths:
-            raise FileNotFoundError(
-                f"[Rhapsody] PreTokenizedDataset: no shard_*.pt files found in {shard_dir}"
-            )
+            raise FileNotFoundError(f"[Rhapsody] No shard_*.pt files found in {shard_dir}")
 
-        num_full   = len(self.shard_paths) - 1
-        self.total_examples = num_full * self.examples_per_shard + self.last_shard_examples
-
-        print(
-            f"[Rhapsody] PreTokenizedDataset: {len(self.shard_paths)} shards, "
-            f"{self.total_examples:,} examples, "
-            f"~{self.total_examples * seq_len / 1e9:.2f}B tokens"
-        )
-
-        # Per-process shard cache: stores up to 2 shards as int16 (saves RAM).
-        # persistent_workers=True keeps these alive across batches.
-        self._cache: dict[int, torch.Tensor] = {}
-
-    # ── Internal helpers ──────────────────────────────────────────────────────
-
-    def _get_shard(self, shard_idx: int) -> torch.Tensor:
-        """Load shard into int16 cache; evict LRU when cache exceeds 2 entries."""
-        if shard_idx not in self._cache:
-            data = torch.load(
-                self.shard_paths[shard_idx],
-                map_location="cpu",
-                weights_only=True,
-                mmap=True,
-            )  # returns int16/int32 tensor mapped lazily
-            self._cache[shard_idx] = data
-            if len(self._cache) > 2:
-                evict = next(iter(self._cache))
-                del self._cache[evict]
-        return self._cache[shard_idx]
-
-    # ── Dataset interface ─────────────────────────────────────────────────────
+        self.cache = {}
 
     def __len__(self) -> int:
-        return self.total_examples
+        return self.num_samples
+
+    def _load_shard(self, shard_idx: int) -> torch.Tensor:
+        if shard_idx in self.cache:
+            return self.cache[shard_idx]
+
+        if len(self.cache) >= 2:
+            self.cache.pop(next(iter(self.cache)))
+
+        shard_path = self.shard_paths[shard_idx]
+        data = torch.load(shard_path, map_location="cpu")
+        self.cache[shard_idx] = data
+        return data
 
     def __getitem__(self, idx: int) -> dict:
-        # Locate shard and local position
-        shard_idx  = idx  // self.examples_per_shard
-        local_idx  = idx  %  self.examples_per_shard
+        global_token_offset = idx * self.seq_len
 
-        # Safety clamp for the partial last shard
-        shard_idx = min(shard_idx, len(self.shard_paths) - 1)
+        shard_idx = global_token_offset // self.shard_size
+        local_offset = global_token_offset % self.shard_size
 
-        start = local_idx * self.chunk_len
-        end   = start + self.chunk_len
+        shard_data = self._load_shard(shard_idx)
 
-        shard = self._get_shard(shard_idx)
-        # Guard against reading past the shard boundary
-        if end > len(shard):
-            end   = len(shard)
-            start = max(0, end - self.chunk_len)
-
-        chunk = shard[start:end].to(torch.long)   # int16 → int64 for embedding lookup
-
-        # Pad with zeros if the very last chunk is shorter than chunk_len (rare edge case)
-        if len(chunk) < self.chunk_len:
-            chunk = torch.cat([
-                chunk,
-                torch.zeros(self.chunk_len - len(chunk), dtype=torch.long),
-            ])
-
-        return {
-            "input_ids": chunk[:-1].clone(),   # [seq_len]  — token t
-            "labels":    chunk[1:].clone(),    # [seq_len]  — token t+1 (pre-shifted)
-        }
-
-
-class AudioTextDataset(Dataset):
-
-    """
-    Map-style dataset for Stage-2 alignment and Stage-3 fine-tuning.
-
-    Stores only lightweight metadata (text + dataset reference + index) during
-    __init__. Raw audio is loaded lazily in __getitem__ via HuggingFace Arrow
-    memory-mapping, avoiding the ~10 GB RAM spike that would occur from eagerly
-    storing all numpy audio arrays.
-
-    Audio is processed through ClapProcessor into mel spectrograms:
-        input_features: [1, mel_bins, time_frames]  (batch dim squeezed)
-    DataLoader collates these to [batch, 1, mel_bins, time_frames].
-
-    Labels are PRE-SHIFTED (consistent with TextPretrainDataset):
-      input_ids[t] = token t
-      labels[t]    = token t+1   (-100 for the last position and padding)
-    """
-
-    def __init__(
-        self,
-        tokenizer: AutoTokenizer,
-        seq_len: int = 2048,
-        encoder_id: str = "laion/clap-htsat-unfused",
-        clotho_split: str = "development",
-    ):
-        from transformers import ClapProcessor
-
-        self.tokenizer = tokenizer
-        self.seq_len = seq_len
-        self.processor = ClapProcessor.from_pretrained(encoder_id)
-
-        # Lightweight metadata only — no raw audio arrays in RAM
-        # Each entry: {"text": str, "source": "clotho"|"audioset",
-        #              "dataset": HF Dataset object, "index": int}
-        self.examples: list[dict] = []
-        self._datasets: dict[str, object] = {}   # keyed by source name, holds HF dataset
-
-        print(f"[Rhapsody] Loading Clotho ({clotho_split} split)...")
-        try:
-            import re
-            # Map soundata/clotho split names to CLAPv2/Clotho split names
-            clotho_split_map = {
-                "development": "train",
-                "validation": "validation",
-                "evaluation": "test"
-            }
-            clotho_hf_split = clotho_split_map.get(clotho_split, clotho_split)
-
-            def split_clotho_captions(text_str):
-                parts = [p.strip() for p in re.split(r'\.\s+', text_str) if p.strip()]
-                if len(parts) == 5:
-                    return parts
-                if len(parts) < 5:
-                    new_parts = []
-                    for p in parts:
-                        if len(new_parts) + (len(parts) - len(new_parts)) < 5:
-                            subparts = [sp.strip() for sp in re.split(r'\s+(?=[A-Z])', p) if sp.strip()]
-                            new_parts.extend(subparts)
-                        else:
-                            new_parts.append(p)
-                    parts = new_parts
-                if len(parts) < 5:
-                    new_parts = []
-                    for p in parts:
-                        subparts = [sp.strip() for sp in re.split(r'\s+(?=[A-Z])', p) if sp.strip()]
-                        new_parts.extend(subparts)
-                    parts = new_parts
-                while len(parts) > 5:
-                    min_idx = -1
-                    min_len = 999999
-                    for idx_p, p in enumerate(parts):
-                        if len(p) < min_len:
-                            min_len = len(p)
-                            min_idx = idx_p
-                    if min_idx == 0:
-                        parts[0] = parts[0] + ' ' + parts[1]
-                        parts.pop(1)
-                    elif min_idx == len(parts) - 1:
-                        parts[min_idx - 1] = parts[min_idx - 1] + ' ' + parts[min_idx]
-                        parts.pop(min_idx)
-                    else:
-                        if len(parts[min_idx - 1]) < len(parts[min_idx + 1]):
-                            parts[min_idx - 1] = parts[min_idx - 1] + ' ' + parts[min_idx]
-                            parts.pop(min_idx)
-                        else:
-                            parts[min_idx] = parts[min_idx] + ' ' + parts[min_idx + 1]
-                            parts.pop(min_idx + 1)
-                return parts
-
-            # CLAPv2/Clotho is public and contains audio bytes natively
-            clotho = load_dataset("CLAPv2/Clotho", split=clotho_hf_split)
-            self._datasets["clotho"] = clotho
-            for i, item in enumerate(clotho):
-                text_field = item.get("text", "")
-                captions = split_clotho_captions(text_field)
-                for text in captions:
-                    if text and len(text) > 20:
-                        if not text.endswith('.'):
-                            text += '.'
-                        self.examples.append({
-                            "text": text,
-                            "source": "clotho",
-                            "index": i,
-                        })
-            print(f"[Rhapsody] Clotho: {len(self.examples)} examples (from {len(clotho)} clips)")
-        except Exception as e:
-            print(f"[Rhapsody] Clotho load failed: {e}")
-
-        print(f"[Rhapsody] Audio-text dataset total: {len(self.examples)} examples")
-
-    def __len__(self) -> int:
-        return len(self.examples)
-
-    def __getitem__(self, idx: int) -> dict:
-        example = self.examples[idx]
-
-        # ── Tokenise text ────────────────────────────────────────────────────
-        tokenized = self.tokenizer(
-            example["text"],
-            truncation=True,
-            max_length=self.seq_len,
-            return_tensors="pt",
-        )
-        input_ids = tokenized["input_ids"].squeeze(0)  # [L] (variable length)
-
-        # Pre-shifted labels: labels[t] = input_ids[t+1], -100 at last pos
-        labels = torch.full_like(input_ids, -100)
-        if len(input_ids) > 1:
-            labels[:-1] = input_ids[1:].clone()
-
-        # ── Load audio lazily, extract CLAP mel features ─────────────────────
-        audio_array = None
-        sampling_rate = 48000
-
-        if example["source"] == "clotho":
-            # HuggingFace Arrow dataset supports O(1) random access — no RAM spike
-            row = self._datasets["clotho"][example["index"]]
-            audio = row.get("audio") or {}
-            audio_array = audio.get("array")
-            sampling_rate = audio.get("sampling_rate", 48000)
-
-        if audio_array is not None and len(audio_array) > 0:
-            try:
-                feats = self.processor(
-                    audios=audio_array,
-                    sampling_rate=sampling_rate,
-                    return_tensors="pt",
-                )
-                # [1, 1, mel_bins, time_frames] → squeeze batch dim → [1, mel_bins, time_frames]
-                audio_features = feats.input_features.squeeze(0)
-            except Exception as e:
-                print(f"[Rhapsody] WARNING: audio processing failed for idx={idx}: {e}")
-                audio_features = torch.zeros(1, 64, 1001)   # CLAP silence fallback
+        if local_offset + self.chunk_len <= len(shard_data):
+            chunk = shard_data[local_offset : local_offset + self.chunk_len]
         else:
-            audio_features = torch.zeros(1, 64, 1001)
+            chunk = shard_data[local_offset:].clone()
+            next_shard_idx = shard_idx + 1
+            if next_shard_idx < len(self.shard_paths):
+                next_shard_data = self._load_shard(next_shard_idx)
+                needed = self.chunk_len - len(chunk)
+                chunk = torch.cat([chunk, next_shard_data[:needed]])
+            else:
+                needed = self.chunk_len - len(chunk)
+                pad = torch.full((needed,), 0, dtype=chunk.dtype)
+                chunk = torch.cat([chunk, pad])
 
-        return {
-            "input_ids": input_ids,         # [L]
-            "labels": labels,               # [L]
-            "audio_features": audio_features,  # [1, mel_bins, time_frames]
-        }
+        chunk_long = chunk.long()
+        input_ids = chunk_long[:-1]
+        labels    = chunk_long[1:]
 
-
-class SymbolicMusicDataset(Dataset):
-    """
-    Dataset for symbolic music generation (ABC / MIDI-like tokens).
-
-    Accepts either:
-      1) A local JSONL file (`dataset_path`) with entries containing
-         symbolic notation and optional conditioning fields.
-      2) A Hugging Face dataset (`hf_dataset`) with a text field containing
-         symbolic notation.
-
-    Local JSONL expected keys (configurable):
-      - symbolic field: required (ABC / REMI / MIDI-like text)
-      - prompt field: optional textual control prompt
-      - audio_path field: optional path for audio conditioning
-
-    Returns pre-shifted labels, consistent with other Rhapsody datasets.
-    """
-
-    _SYMBOLIC_FIELD_CANDIDATES = (
-        "symbolic",
-        "abc",
-        "notation",
-        "score",
-        "midi_tokens",
-        "text",
-        "assistant",
-    )
-
-    def __init__(
-        self,
-        tokenizer: AutoTokenizer,
-        seq_len: int = 1024,
-        encoder_id: str = "laion/clap-htsat-unfused",
-        dataset_path: Optional[str] = None,
-        hf_dataset: Optional[str] = None,
-        hf_split: str = "train",
-        symbolic_field: Optional[str] = None,
-        prompt_field: str = "prompt",
-        audio_path_field: str = "audio_path",
-        max_examples: Optional[int] = None,
-    ):
-        from transformers import ClapProcessor
-
-        self.tokenizer = tokenizer
-        self.seq_len = seq_len
-        self.prompt_field = prompt_field
-        self.audio_path_field = audio_path_field
-        self.symbolic_field = symbolic_field
-        self.examples: list[dict] = []
-        self.processor = ClapProcessor.from_pretrained(encoder_id)
-
-        if dataset_path is not None:
-            self._load_local_jsonl(Path(dataset_path), max_examples=max_examples)
-        else:
-            ds_name = hf_dataset or "Seeker38/music_abc_notation"
-            self._load_hf_dataset(ds_name, hf_split, max_examples=max_examples)
-
-        print(f"[Rhapsody] Symbolic dataset total: {len(self.examples)} examples")
-
-    def _resolve_symbolic_field(self, sample: dict) -> Optional[str]:
-        if self.symbolic_field is not None and self.symbolic_field in sample:
-            return self.symbolic_field
-        keys_lc = {k.lower(): k for k in sample.keys()}
-        for candidate in self._SYMBOLIC_FIELD_CANDIDATES:
-            if candidate in sample:
-                return candidate
-            if candidate in keys_lc:
-                return keys_lc[candidate]
-        return None
-
-    def _load_local_jsonl(self, path: Path, max_examples: Optional[int]) -> None:
-        print(f"[Rhapsody] Loading symbolic JSONL: {path}")
-        if not path.exists():
-            raise FileNotFoundError(f"Symbolic dataset path not found: {path}")
-
-        with path.open("r", encoding="utf-8") as f:
-            for i, line in enumerate(f):
-                if max_examples is not None and len(self.examples) >= max_examples:
-                    break
-                line = line.strip()
-                if not line:
-                    continue
-                item = json.loads(line)
-                symbolic_key = self._resolve_symbolic_field(item)
-                if symbolic_key is None:
-                    continue
-                symbolic_text = item.get(symbolic_key)
-                if not isinstance(symbolic_text, str) or len(symbolic_text) < 8:
-                    continue
-                self.examples.append(
-                    {
-                        "symbolic": symbolic_text,
-                        "prompt": item.get(self.prompt_field, ""),
-                        "audio_path": item.get(self.audio_path_field),
-                    }
-                )
-                if (i + 1) % 10000 == 0:
-                    print(f"[Rhapsody] Parsed {i + 1} lines...")
-
-    def _load_hf_dataset(self, name: str, split: str, max_examples: Optional[int]) -> None:
-        print(f"[Rhapsody] Loading symbolic HF dataset: {name} [{split}]")
-        ds = load_dataset(name, split=split, streaming=True)
-        for row in ds:
-            if max_examples is not None and len(self.examples) >= max_examples:
-                break
-            symbolic_key = self._resolve_symbolic_field(row)
-            if symbolic_key is None:
-                continue
-            symbolic_text = row.get(symbolic_key)
-            if not isinstance(symbolic_text, str) or len(symbolic_text) < 8:
-                continue
-            self.examples.append(
-                {
-                    "symbolic": symbolic_text,
-                    "prompt": row.get(self.prompt_field, ""),
-                    "audio_path": row.get(self.audio_path_field),
-                }
-            )
-
-    def __len__(self) -> int:
-        return len(self.examples)
-
-    def _extract_audio_features(self, audio_path: Optional[str]) -> Optional[torch.Tensor]:
-        if not audio_path:
-            return None
-        try:
-            path = Path(audio_path)
-            if not path.exists():
-                return None
-            waveform, sr = torchaudio.load(str(path))
-            if waveform.shape[0] > 1:
-                waveform = waveform.mean(dim=0, keepdim=True)
-            if sr != 48000:
-                import torchaudio.functional as F_audio
-                waveform = F_audio.resample(waveform, orig_freq=sr, new_freq=48000)
-            waveform = waveform.squeeze(0)
-            feats = self.processor(
-                audios=waveform.numpy(),
-                sampling_rate=48000,
-                return_tensors="pt",
-            )
-            return feats.input_features.squeeze(0)
-        except Exception as e:
-            print(f"[Rhapsody] WARNING: failed to load or process audio from {audio_path}: {e}")
-            return None
-
-    def __getitem__(self, idx: int) -> dict:
-        example = self.examples[idx]
-
-        prompt = example.get("prompt") or ""
-        symbolic = example["symbolic"]
-        if prompt:
-            text = f"<|music|> {prompt}\n<|abc_start|> {symbolic} <|abc_end|>"
-        else:
-            text = f"<|music|> <|abc_start|> {symbolic} <|abc_end|>"
-
-        tokenized = self.tokenizer(
-            text,
-            truncation=True,
-            max_length=self.seq_len,
-            return_tensors="pt",
-        )
-        input_ids = tokenized["input_ids"].squeeze(0)
-
-        labels = torch.full_like(input_ids, -100)
-        if len(input_ids) > 1:
-            labels[:-1] = input_ids[1:].clone()
-
-        item = {"input_ids": input_ids, "labels": labels}
-        audio_features = self._extract_audio_features(example.get("audio_path"))
-        if audio_features is not None:
-            item["audio_features"] = audio_features
-        return item
+        return {"input_ids": input_ids, "labels": labels}
 
 
 class DataCollatorWithPadding:
@@ -678,7 +266,6 @@ class DataCollatorWithPadding:
 
         padded_input_ids = []
         padded_labels = []
-        audio_features_list = []
 
         for item in batch:
             input_ids = item["input_ids"]
@@ -702,23 +289,7 @@ class DataCollatorWithPadding:
             padded_input_ids.append(padded_input)
             padded_labels.append(padded_label)
 
-            if "audio_features" in item:
-                audio_features_list.append(item["audio_features"])
-
-        collated = {
+        return {
             "input_ids": torch.stack(padded_input_ids, dim=0),
             "labels": torch.stack(padded_labels, dim=0),
         }
-
-        has_audio = any("audio_features" in item for item in batch)
-        if has_audio:
-            # Re-build audio_features_list to ensure correct ordering and filling of missing values
-            audio_features_list = []
-            for item in batch:
-                if "audio_features" not in item or item["audio_features"] is None:
-                    # CLAP default silence features shape is [1, 64, 1001]
-                    item["audio_features"] = torch.zeros(1, 64, 1001)
-                audio_features_list.append(item["audio_features"])
-            collated["audio_features"] = torch.stack(audio_features_list, dim=0)
-
-        return collated

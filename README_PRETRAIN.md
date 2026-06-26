@@ -1,3 +1,13 @@
+---
+license: mit
+datasets:
+- HuggingFaceFW/fineweb-edu
+- mlfoundations/dclm-baseline-1.0
+- HuggingFaceTB/cosmopedia
+language:
+- en
+pipeline_tag: text-generation
+---
 # Rhapsody TextLM (Base Model)
 
 Rhapsody TextLM is an 84-million parameter, decoder-only Transformer language model. It is designed as a lightweight, high-performance base model optimized for resource-constrained environments (such as Google Colab T4 GPUs).

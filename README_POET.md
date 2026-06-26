@@ -1,3 +1,13 @@
+---
+license: mit
+datasets:
+- taucris/haiku_333K
+language:
+- en
+base_model:
+- Kush26/rhapsody-84m-pretrain
+pipeline_tag: text-generation
+---
 # Rhapsody Constraint Poet (Haiku Generator)
 
 Rhapsody Constraint Poet is an 84-million parameter Transformer language model fine-tuned to generate structured, topic-constrained 5-7-5 haikus. 
